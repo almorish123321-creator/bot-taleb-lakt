@@ -4,6 +4,7 @@ import os
 import json
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.tl.types import Chat, Channel
 from flask import Flask
 from threading import Thread
 from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config
@@ -32,6 +33,22 @@ def keep_alive():
 bot = None
 active_clients = {} # {phone: TelegramClient}
 login_states = {} # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
+
+async def import_groups(client):
+    """استيراد كافة المجموعات التي ينتمي إليها الحساب."""
+    config = load_json_config()
+    current_groups = config.get('TARGET_GROUPS', [])
+    new_groups_count = 0
+    
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group or dialog.is_channel:
+            if dialog.id not in current_groups:
+                current_groups.append(dialog.id)
+                new_groups_count += 1
+    
+    config['TARGET_GROUPS'] = current_groups
+    update_json_config(config)
+    return new_groups_count
 
 async def start_monitoring(client, phone):
     """بدء مراقبة الرسائل للحساب المرتبط."""
@@ -124,9 +141,20 @@ async def setup_bot_handlers():
 
         elif data == b'manage_groups':
             group_list = config.get('TARGET_GROUPS', [])
-            msg = "👥 **المجموعات المستهدفة (ID):**\n" + ("\n".join([f"- `{g}`" for g in group_list]) if group_list else "يتم مراقبة جميع المجموعات.")
-            buttons = [[Button.inline('➕ إضافة', b'add_group'), Button.inline('➖ حذف', b'rem_group')], [Button.inline('🔙 رجوع', b'back_main')]]
+            msg = f"👥 **المجموعات المستهدفة:** تم استيراد `{len(group_list)}` مجموعة.\n" + "(يتم مراقبة جميع المجموعات المستوردة)" if group_list else "لا توجد مجموعات مستوردة."
+            buttons = [[Button.inline('➕ إضافة يدوي', b'add_group'), Button.inline('➖ حذف يدوي', b'rem_group')], 
+                       [Button.inline('🔄 تحديث واستيراد', b'refresh_groups')],
+                       [Button.inline('🔙 رجوع', b'back_main')]]
             await event.respond(msg, buttons=buttons)
+
+        elif data == b'refresh_groups':
+            if not active_clients:
+                await event.respond("❌ يجب ربط حساب واحد على الأقل للاستيراد.")
+            else:
+                total_new = 0
+                for phone, client in active_clients.items():
+                    total_new += await import_groups(client)
+                await event.respond(f"✅ تم الانتهاء! تم استيراد `{total_new}` مجموعة جديدة.")
 
         elif data == b'rem_acc':
             if not active_clients:
@@ -175,10 +203,16 @@ async def setup_bot_handlers():
         
         elif state['step'] == 'await_code':
             try:
-                await state['client'].sign_in(state['phone'], text, phone_code_hash=state['hash'])
-                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
-                active_clients[state['phone']] = state['client']
-                asyncio.create_task(start_monitoring(state['client'], state['phone']))
+                client = state['client']
+                await client.sign_in(state['phone'], text, phone_code_hash=state['hash'])
+                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
+                
+                # تلقائياً استيراد المجموعات عند الإضافة
+                new_count = await import_groups(client)
+                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة جديدة من هذا الحساب.")
+                
+                active_clients[state['phone']] = client
+                asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
                 state['step'] = 'await_password'
@@ -188,10 +222,15 @@ async def setup_bot_handlers():
 
         elif state['step'] == 'await_password':
             try:
-                await state['client'].sign_in(password=text)
-                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
-                active_clients[state['phone']] = state['client']
-                asyncio.create_task(start_monitoring(state['client'], state['phone']))
+                client = state['client']
+                await client.sign_in(password=text)
+                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
+                
+                new_count = await import_groups(client)
+                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة جديدة.")
+                
+                active_clients[state['phone']] = client
+                asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
