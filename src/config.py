@@ -14,31 +14,61 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 if CHANNEL_ID:
-    CHANNEL_ID = int(3772298383)
+    CHANNEL_ID = int(CHANNEL_ID)
 
 SESSION_NAME = os.getenv('SESSION_NAME', 'telegram_monitor_session')
 
-# Load configuration from config.json
-# Use absolute path relative to this file to avoid issues
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+# ============ إعدادات ملف JSON ============
+# استخدام نفس المجلد الذي يوجد فيه config.py لتخزين config_data.json
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, 'config_data.json')
 
 def load_json_config():
+    """تحميل جميع الإعدادات من ملف JSON مع القيم الافتراضية"""
+    default_config = {
+        "KEYWORDS": [],
+        "IGNORE_USERS": [],
+        "TARGET_GROUPS": [],
+        "BANNED_ADS": ["عرض", "خصم", "تخفيض", "سعر", "شراء", "بيع", "كوبون", "تسويق", "إعلان"],
+        "SUSPICIOUS_WORDS": ["احتيال", "نصبة", "فيروس", "اختراق", "تزوير", "فدية", "سرقة"],
+        "FILTERS": {
+            "max_length": 50,
+            "block_links": True,
+            "block_phones": True,
+            "block_mentions": True,
+            "block_ads": True,
+            "block_suspicious": True
+        }
+    }
+    
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {"TARGET_GROUPS": [], "KEYWORDS": [], "IGNORE_USERS": []}
-    return {"TARGET_GROUPS": [], "KEYWORDS": [], "IGNORE_USERS": []}
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            # دمج القيم المحملة مع القيم الافتراضية (لأي مفاتيح مفقودة)
+            for key, value in default_config.items():
+                if key not in config:
+                    config[key] = value
+            return config
+        except Exception as e:
+            print(f"خطأ في تحميل config_data.json: {e}")
+            return default_config
+    else:
+        return default_config
 
 def update_json_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+    """حفظ الإعدادات إلى ملف JSON"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"خطأ في حفظ config_data.json: {e}")
 
-# Load dynamic config from JSON
+# تحميل الإعدادات الديناميكية من JSON (للاستخدام المباشر إذا أردت)
 json_config = load_json_config()
-
 TARGET_GROUPS = json_config.get('TARGET_GROUPS', [])
 KEYWORDS = json_config.get('KEYWORDS', [])
 IGNORE_USERS = json_config.get('IGNORE_USERS', [])
+BANNED_ADS = json_config.get('BANNED_ADS', [])
+SUSPICIOUS_WORDS = json_config.get('SUSPICIOUS_WORDS', [])
+FILTERS = json_config.get('FILTERS', {})
