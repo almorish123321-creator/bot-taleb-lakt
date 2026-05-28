@@ -14,7 +14,7 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 if CHANNEL_ID:
-    CHANNEL_ID = int(CHANNEL_ID)
+    CHANNEL_ID = int(3772298383)
 
 SESSION_NAME = os.getenv('SESSION_NAME', 'telegram_monitor_session')
 
