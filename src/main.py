@@ -17,7 +17,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "البوت يعمل بنجاح!"
 
 def run():
     port = int(os.environ.get('PORT', 8080))
@@ -34,7 +34,7 @@ active_clients = {} # {phone: TelegramClient}
 login_states = {} # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
 
 async def start_monitoring(client, phone):
-    """Start monitoring for a specific account client."""
+    """بدء مراقبة الرسائل للحساب المرتبط."""
     @client.on(events.NewMessage())
     async def handler(event):
         config = load_json_config()
@@ -42,7 +42,10 @@ async def start_monitoring(client, phone):
         ignore_users = config.get('IGNORE_USERS', [])
         target_groups = config.get('TARGET_GROUPS', [])
         
-        if event.is_group and (not target_groups or event.chat_id in target_groups):
+        if event.is_group:
+            if target_groups and event.chat_id not in target_groups:
+                return
+                
             sender_id = event.sender_id
             if sender_id in ignore_users:
                 return
@@ -51,7 +54,7 @@ async def start_monitoring(client, phone):
             if any(kw.lower() in message_text.lower() for kw in keywords):
                 try:
                     chat = await event.get_chat()
-                    chat_title = getattr(chat, 'title', 'Unknown Group')
+                    chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
                     
                     link = ""
                     if event.chat:
@@ -62,107 +65,186 @@ async def start_monitoring(client, phone):
                             link = f"https://t.me/c/{c_id}/{event.id}"
                     
                     forward_text = (
-                        f"📢 **New Match Found!**\n\n"
-                        f"👥 **Group:** {chat_title}\n"
-                        f"👤 **User ID:** `{sender_id}`\n"
-                        f"📝 **Message:**\n{message_text}\n"
+                        f"📢 **تم العثور على رسالة مطابقة!**\n\n"
+                        f"👥 **المجموعة:** {chat_title}\n"
+                        f"👤 **معرف المرسل:** `{sender_id}`\n"
+                        f"📝 **الرسالة:**\n{message_text}\n"
                     )
                     
-                    buttons = [[Button.url("View Message", url=link)]] if link else None
+                    buttons = [[Button.url("عرض الرسالة الأصلية", url=link)]] if link else None
                     await bot.send_message(CHANNEL_ID, forward_text, buttons=buttons)
-                    logger.info(f"Forwarded message from {phone}")
+                    logger.info(f"تم توجيه رسالة من الحساب {phone}")
                 except Exception as e:
-                    logger.error(f"Error forwarding message: {e}")
+                    logger.error(f"خطأ في توجيه الرسالة: {e}")
 
-    logger.info(f"Started monitoring for {phone}")
-    await client.run_until_disconnected()
+    logger.info(f"بدأت المراقبة للحساب {phone}")
+    try:
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"انقطع اتصال الحساب {phone}: {e}")
 
 async def setup_bot_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_handler(event):
         buttons = [
-            [Button.inline('➕ Add Account', b'add_acc')],
-            [Button.inline('📋 List Accounts', b'list_acc')],
-            [Button.inline('⚙️ Keywords', b'manage_kw')]
+            [Button.inline('➕ إضافة حساب', b'add_acc'), Button.inline('📋 الحسابات المرتبطة', b'list_acc')],
+            [Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')],
+            [Button.inline('👥 المجموعات المستهدفة', b'manage_groups'), Button.inline('❌ حذف حساب', b'rem_acc')]
         ]
-        await event.respond('👋 **Welcome to Telegram Monitor Manager**\n\nChoose an option:', buttons=buttons)
+        await event.respond('👋 **أهلاً بك في مدير مراقبة تيليجرام**\n\nتحكم في حساباتك وإعدادات المراقبة من هنا:', buttons=buttons)
 
     @bot.on(events.CallbackQuery())
     async def callback_handler(event):
         user_id = event.sender_id
         data = event.data
+        config = load_json_config()
+        
         if data == b'add_acc':
             login_states[user_id] = {'step': 'await_phone'}
-            await event.respond("📱 Please send the **Phone Number** in international format (e.g., +1234567890):")
+            await event.respond("📱 من فضلك أرسل **رقم الهاتف** مع مفتاح الدولة (مثال: +9665xxxxxxxx):")
+        
         elif data == b'list_acc':
             if not active_clients:
-                await event.respond("❌ No active accounts linked.")
+                await event.respond("❌ لا توجد حسابات مرتبطة حالياً.")
             else:
-                msg = "✅ **Linked Accounts:**\n"
-                for phone in active_clients.keys():
-                    msg += f"- `{phone}`\n"
+                msg = "✅ **الحسابات المرتبطة:**\n" + "\n".join([f"- `{p}`" for p in active_clients.keys()])
                 await event.respond(msg)
+
+        elif data == b'manage_kw':
+            kw_list = config.get('KEYWORDS', [])
+            msg = "🔑 **الكلمات المفتاحية الحالية:**\n" + ("\n".join([f"- `{k}`" for k in kw_list]) if kw_list else "لا توجد كلمات.")
+            buttons = [[Button.inline('➕ إضافة', b'add_kw'), Button.inline('➖ حذف', b'rem_kw')], [Button.inline('🔙 رجوع', b'back_main')]]
+            await event.respond(msg, buttons=buttons)
+
+        elif data == b'manage_ignore':
+            ignore_list = config.get('IGNORE_USERS', [])
+            msg = "🚫 **قائمة التجاهل (ID المستخدمين):**\n" + ("\n".join([f"- `{u}`" for u in ignore_list]) if ignore_list else "القائمة فارغة.")
+            buttons = [[Button.inline('➕ إضافة', b'add_ignore'), Button.inline('➖ حذف', b'rem_ignore')], [Button.inline('🔙 رجوع', b'back_main')]]
+            await event.respond(msg, buttons=buttons)
+
+        elif data == b'manage_groups':
+            group_list = config.get('TARGET_GROUPS', [])
+            msg = "👥 **المجموعات المستهدفة (ID):**\n" + ("\n".join([f"- `{g}`" for g in group_list]) if group_list else "يتم مراقبة جميع المجموعات.")
+            buttons = [[Button.inline('➕ إضافة', b'add_group'), Button.inline('➖ حذف', b'rem_group')], [Button.inline('🔙 رجوع', b'back_main')]]
+            await event.respond(msg, buttons=buttons)
+
+        elif data == b'rem_acc':
+            if not active_clients:
+                await event.respond("❌ لا توجد حسابات لحذفها.")
+            else:
+                buttons = [[Button.inline(p, f"del_acc_{p}".encode())] for p in active_clients.keys()]
+                buttons.append([Button.inline('🔙 رجوع', b'back_main')])
+                await event.respond("🗑 اختر الحساب الذي تريد حذفه:", buttons=buttons)
+
+        elif data.startswith(b'del_acc_'):
+            phone = data.decode().replace('del_acc_', '')
+            if phone in active_clients:
+                await active_clients[phone].disconnect()
+                del active_clients[phone]
+                if os.path.exists(f'session_{phone}.session'):
+                    os.remove(f'session_{phone}.session')
+                await event.respond(f"✅ تم حذف الحساب `{phone}` بنجاح.")
+            else:
+                await event.respond("❌ الحساب غير موجود.")
+
+        elif data == b'back_main':
+            await start_handler(event)
+
+        elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
+            login_states[user_id] = {'step': data.decode()}
+            await event.respond(f"📝 من فضلك أرسل القيمة التي تريد تنفيذ الإجراء عليها:")
 
     @bot.on(events.NewMessage())
     async def input_handler(event):
         user_id = event.sender_id
         if user_id not in login_states: return
         state = login_states[user_id]
-        text = event.message.message
+        text = event.message.message.strip()
+        config = load_json_config()
         
         if state['step'] == 'await_phone':
-            phone = text.strip()
+            phone = text
             new_client = TelegramClient(f'session_{phone}', API_ID, API_HASH)
             await new_client.connect()
             try:
                 sent_code = await new_client.send_code_request(phone)
                 login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client}
-                await event.respond(f"📩 Code sent to `{phone}`. Please enter the code:")
+                await event.respond(f"📩 تم إرسال الكود إلى `{phone}`. من فضلك أرسل الكود هنا:")
             except Exception as e:
-                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
+                await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+        
         elif state['step'] == 'await_code':
             try:
-                await state['client'].sign_in(state['phone'], text.strip(), phone_code_hash=state['hash'])
-                await event.respond(f"✅ Successfully linked `{state['phone']}`!")
+                await state['client'].sign_in(state['phone'], text, phone_code_hash=state['hash'])
+                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 active_clients[state['phone']] = state['client']
                 asyncio.create_task(start_monitoring(state['client'], state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
                 state['step'] = 'await_password'
-                await event.respond("🔐 2FA is enabled. Please enter your password:")
+                await event.respond("🔐 هذا الحساب محمي بكلمة سر (2FA). من فضلك أرسل كلمة السر:")
             except Exception as e:
-                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
+                await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+
         elif state['step'] == 'await_password':
             try:
-                await state['client'].sign_in(password=text.strip())
-                await event.respond(f"✅ Successfully linked `{state['phone']}` with 2FA!")
+                await state['client'].sign_in(password=text)
+                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 active_clients[state['phone']] = state['client']
                 asyncio.create_task(start_monitoring(state['client'], state['phone']))
                 del login_states[user_id]
             except Exception as e:
-                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
+                await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+
+        elif state['step'] == 'add_kw':
+            config['KEYWORDS'] = list(set(config.get('KEYWORDS', []) + [text]))
+            update_json_config(config)
+            await event.respond(f"✅ تم إضافة الكلمة: `{text}`"); del login_states[user_id]
+
+        elif state['step'] == 'rem_kw':
+            config['KEYWORDS'] = [k for k in config.get('KEYWORDS', []) if k != text]
+            update_json_config(config)
+            await event.respond(f"✅ تم حذف الكلمة: `{text}`"); del login_states[user_id]
+
+        elif state['step'] == 'add_ignore':
+            try:
+                config['IGNORE_USERS'] = list(set(config.get('IGNORE_USERS', []) + [int(text)]))
+                update_json_config(config)
+                await event.respond(f"✅ تم إضافة المعرف `{text}` لقائمة التجاهل."); del login_states[user_id]
+            except: await event.respond("❌ المعرف غير صحيح.")
+
+        elif state['step'] == 'rem_ignore':
+            try:
+                config['IGNORE_USERS'] = [u for u in config.get('IGNORE_USERS', []) if u != int(text)]
+                update_json_config(config)
+                await event.respond(f"✅ تم حذف المعرف `{text}` من قائمة التجاهل."); del login_states[user_id]
+            except: await event.respond("❌ المعرف غير صحيح.")
 
 async def main():
     global bot
     keep_alive()
-    logger.info("Initializing Bot Client...")
+    logger.info("جاري تشغيل البوت...")
     bot = TelegramClient('bot_session', API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
     await setup_bot_handlers()
     
-    # Resume sessions
+    # Resume existing sessions
     for f in os.listdir('.'):
         if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
             phone = f.replace('session_', '').replace('.session', '')
             try:
                 client = TelegramClient(f.replace('.session', ''), API_ID, API_HASH)
-                await client.start()
-                active_clients[phone] = client
-                asyncio.create_task(start_monitoring(client, phone))
-                logger.info(f"Resumed {phone}")
-            except: pass
+                await client.connect()
+                if await client.is_user_authorized():
+                    active_clients[phone] = client
+                    asyncio.create_task(start_monitoring(client, phone))
+                    logger.info(f"تم استئناف الحساب {phone}")
+                else:
+                    logger.warning(f"الجلسة {phone} غير مصرحة.")
+            except Exception as e:
+                logger.error(f"فشل استئناف الحساب {phone}: {e}")
 
-    logger.info("Bot is running.")
+    logger.info("البوت يعمل الآن بكامل طاقته.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
