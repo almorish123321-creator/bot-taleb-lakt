@@ -9,12 +9,22 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 if API_ID:
     API_ID = int(API_ID)
+else:
+    raise ValueError("❌ API_ID غير موجود! تأكد من إضافته في متغيرات البيئة (.env)")
 
 API_HASH = os.getenv('API_HASH')
+if not API_HASH:
+    raise ValueError("❌ API_HASH غير موجود! تأكد من إضافته في متغيرات البيئة (.env)")
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN غير موجود! تأكد من إضافته في متغيرات البيئة (.env)")
+
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 if CHANNEL_ID:
     CHANNEL_ID = int(CHANNEL_ID)
+else:
+    raise ValueError("❌ CHANNEL_ID غير موجود! تأكد من إضافته في متغيرات البيئة (.env)")
 
 SESSION_NAME = os.getenv('SESSION_NAME', 'telegram_monitor_session')
 
@@ -32,10 +42,10 @@ def load_json_config():
         "BANNED_ADS": ["عرض", "خصم", "تخفيض", "سعر", "شراء", "بيع", "كوبون", "تسويق", "إعلان"],
         "SUSPICIOUS_WORDS": ["احتيال", "نصبة", "فيروس", "اختراق", "تزوير", "فدية", "سرقة"],
         "FILTERS": {
-            "max_length": 50,
-            "block_links": True,
+            "max_length": 4096,
+            "block_links": False,
             "block_phones": True,
-            "block_mentions": True,
+            "block_mentions": False,
             "block_ads": True,
             "block_suspicious": True
         }
@@ -49,6 +59,15 @@ def load_json_config():
             for key, value in default_config.items():
                 if key not in config:
                     config[key] = value
+            
+            # التأكد من وجود FILTERS بالكامل مع كل المفاتيح
+            if 'FILTERS' not in config:
+                config['FILTERS'] = default_config['FILTERS']
+            else:
+                for fk, fv in default_config['FILTERS'].items():
+                    if fk not in config['FILTERS']:
+                        config['FILTERS'][fk] = fv
+            
             return config
         except Exception as e:
             print(f"خطأ في تحميل config_data.json: {e}")
