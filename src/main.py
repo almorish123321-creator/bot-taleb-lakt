@@ -28,8 +28,8 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# Global variables to manage sessions
-bot = TelegramClient('bot_session', API_ID, API_HASH)
+# Global variables
+bot = None
 active_clients = {} # {phone: TelegramClient}
 login_states = {} # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
 
@@ -50,7 +50,6 @@ async def start_monitoring(client, phone):
             message_text = event.message.message or ""
             if any(kw.lower() in message_text.lower() for kw in keywords):
                 try:
-                    # Construct forward message
                     chat = await event.get_chat()
                     chat_title = getattr(chat, 'title', 'Unknown Group')
                     
@@ -78,123 +77,92 @@ async def start_monitoring(client, phone):
     logger.info(f"Started monitoring for {phone}")
     await client.run_until_disconnected()
 
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    buttons = [
-        [Button.inline('➕ Add Account', b'add_acc')],
-        [Button.inline('📋 List Accounts', b'list_acc')],
-        [Button.inline('⚙️ Keywords', b'manage_kw')],
-        [Button.inline('🚫 Ignore List', b'manage_ignore')]
-    ]
-    await event.respond('👋 **Welcome to Telegram Monitor Manager**\n\nChoose an option:', buttons=buttons)
+async def setup_bot_handlers():
+    @bot.on(events.NewMessage(pattern='/start'))
+    async def start_handler(event):
+        buttons = [
+            [Button.inline('➕ Add Account', b'add_acc')],
+            [Button.inline('📋 List Accounts', b'list_acc')],
+            [Button.inline('⚙️ Keywords', b'manage_kw')]
+        ]
+        await event.respond('👋 **Welcome to Telegram Monitor Manager**\n\nChoose an option:', buttons=buttons)
 
-@bot.on(events.CallbackQuery())
-async def callback_handler(event):
-    user_id = event.sender_id
-    data = event.data
-    
-    if data == b'add_acc':
-        login_states[user_id] = {'step': 'await_phone'}
-        await event.respond("📱 Please send the **Phone Number** in international format (e.g., +1234567890):")
-    
-    elif data == b'list_acc':
-        if not active_clients:
-            await event.respond("❌ No active accounts linked.")
-        else:
-            msg = "✅ **Linked Accounts:**\n"
-            for phone in active_clients.keys():
-                msg += f"- `{phone}`\n"
-            await event.respond(msg)
+    @bot.on(events.CallbackQuery())
+    async def callback_handler(event):
+        user_id = event.sender_id
+        data = event.data
+        if data == b'add_acc':
+            login_states[user_id] = {'step': 'await_phone'}
+            await event.respond("📱 Please send the **Phone Number** in international format (e.g., +1234567890):")
+        elif data == b'list_acc':
+            if not active_clients:
+                await event.respond("❌ No active accounts linked.")
+            else:
+                msg = "✅ **Linked Accounts:**\n"
+                for phone in active_clients.keys():
+                    msg += f"- `{phone}`\n"
+                await event.respond(msg)
 
-    elif data == b'manage_kw':
-        config = load_json_config()
-        kw_list = config.get('KEYWORDS', [])
-        msg = "🔑 **Current Keywords:**\n" + ("\n".join([f"- `{k}`" for k in kw_list]) if kw_list else "None")
-        buttons = [[Button.inline('➕ Add Keyword', b'add_kw')], [Button.inline('🔙 Back', b'back_main')]]
-        await event.respond(msg, buttons=buttons)
-
-@bot.on(events.NewMessage())
-async def input_handler(event):
-    user_id = event.sender_id
-    if user_id not in login_states:
-        return
-    
-    state = login_states[user_id]
-    text = event.message.message
-    
-    if state['step'] == 'await_phone':
-        phone = text.strip()
-        new_client = TelegramClient(f'session_{phone}', API_ID, API_HASH)
-        await new_client.connect()
+    @bot.on(events.NewMessage())
+    async def input_handler(event):
+        user_id = event.sender_id
+        if user_id not in login_states: return
+        state = login_states[user_id]
+        text = event.message.message
         
-        try:
-            sent_code = await new_client.send_code_request(phone)
-            login_states[user_id] = {
-                'step': 'await_code',
-                'phone': phone,
-                'hash': sent_code.phone_code_hash,
-                'client': new_client
-            }
-            await event.respond(f"📩 Code sent to `{phone}`. Please enter the code:")
-        except Exception as e:
-            await event.respond(f"❌ Error: {e}")
-            del login_states[user_id]
-
-    elif state['step'] == 'await_code':
-        code = text.strip()
-        phone = state['phone']
-        client = state['client']
-        phone_hash = state['hash']
-        
-        try:
-            await client.sign_in(phone, code, phone_code_hash=phone_hash)
-            await event.respond(f"✅ Successfully linked `{phone}`!")
-            active_clients[phone] = client
-            asyncio.create_task(start_monitoring(client, phone))
-            del login_states[user_id]
-        except SessionPasswordNeededError:
-            login_states[user_id]['step'] = 'await_password'
-            await event.respond("🔐 2FA is enabled. Please enter your password:")
-        except PhoneCodeInvalidError:
-            await event.respond("❌ Invalid code. Try again:")
-        except Exception as e:
-            await event.respond(f"❌ Error: {e}")
-            del login_states[user_id]
-
-    elif state['step'] == 'await_password':
-        password = text.strip()
-        client = state['client']
-        phone = state['phone']
-        try:
-            await client.sign_in(password=password)
-            await event.respond(f"✅ Successfully linked `{phone}` with 2FA!")
-            active_clients[phone] = client
-            asyncio.create_task(start_monitoring(client, phone))
-            del login_states[user_id]
-        except Exception as e:
-            await event.respond(f"❌ Error: {e}")
-            del login_states[user_id]
+        if state['step'] == 'await_phone':
+            phone = text.strip()
+            new_client = TelegramClient(f'session_{phone}', API_ID, API_HASH)
+            await new_client.connect()
+            try:
+                sent_code = await new_client.send_code_request(phone)
+                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client}
+                await event.respond(f"📩 Code sent to `{phone}`. Please enter the code:")
+            except Exception as e:
+                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
+        elif state['step'] == 'await_code':
+            try:
+                await state['client'].sign_in(state['phone'], text.strip(), phone_code_hash=state['hash'])
+                await event.respond(f"✅ Successfully linked `{state['phone']}`!")
+                active_clients[state['phone']] = state['client']
+                asyncio.create_task(start_monitoring(state['client'], state['phone']))
+                del login_states[user_id]
+            except SessionPasswordNeededError:
+                state['step'] = 'await_password'
+                await event.respond("🔐 2FA is enabled. Please enter your password:")
+            except Exception as e:
+                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
+        elif state['step'] == 'await_password':
+            try:
+                await state['client'].sign_in(password=text.strip())
+                await event.respond(f"✅ Successfully linked `{state['phone']}` with 2FA!")
+                active_clients[state['phone']] = state['client']
+                asyncio.create_task(start_monitoring(state['client'], state['phone']))
+                del login_states[user_id]
+            except Exception as e:
+                await event.respond(f"❌ Error: {e}"); del login_states[user_id]
 
 async def main():
+    global bot
     keep_alive()
-    logger.info("Starting Bot...")
+    logger.info("Initializing Bot Client...")
+    bot = TelegramClient('bot_session', API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
+    await setup_bot_handlers()
     
-    # Try to resume existing sessions
-    session_files = [f for f in os.listdir('.') if f.startswith('session_') and f.endswith('.session')]
-    for f in session_files:
-        phone = f.replace('session_', '').replace('.session', '')
-        if phone == "bot": continue
-        try:
-            client = TelegramClient(f.replace('.session', ''), API_ID, API_HASH)
-            await client.start()
-            active_clients[phone] = client
-            asyncio.create_task(start_monitoring(client, phone))
-            logger.info(f"Resumed session for {phone}")
-        except Exception as e:
-            logger.error(f"Failed to resume {phone}: {e}")
+    # Resume sessions
+    for f in os.listdir('.'):
+        if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
+            phone = f.replace('session_', '').replace('.session', '')
+            try:
+                client = TelegramClient(f.replace('.session', ''), API_ID, API_HASH)
+                await client.start()
+                active_clients[phone] = client
+                asyncio.create_task(start_monitoring(client, phone))
+                logger.info(f"Resumed {phone}")
+            except: pass
 
-    logger.info("Bot is fully operational.")
+    logger.info("Bot is running.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
