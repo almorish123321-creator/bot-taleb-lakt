@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Telegram Session Files (حساسة جداً - لا ترفعها!)
+*.session
+session_*.session
+bot.session
+bot_session.session
+
+# Environment Variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+bot_debug.log
+
+# Config data (يتم إنشاؤه تلقائياً)
+src/config_data.json
