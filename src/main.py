@@ -3,6 +3,7 @@ import asyncio
 import os
 import json
 import re
+import time
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.tl.types import Chat, Channel
@@ -32,8 +33,14 @@ def keep_alive():
 
 # Global variables
 bot = None
-active_clients = {} # {phone: TelegramClient}
-login_states = {} # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
+active_clients = {}  # {phone: TelegramClient}
+login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
+
+# ============ تخزين مؤقت ============
+# message_map: {channel_msg_id: {"group_id": ..., "message_id": ..., "sender_id": ..., "phone": ...}}
+message_map = {}
+# seen_messages: مجموعة لتتبع الرسائل المعالجة (كشف التكرار)
+seen_messages = set()
 
 # ============ دوال الفلترة المتقدمة ============
 
@@ -84,7 +91,6 @@ def should_ignore_message(message_text, config):
     """تطبيق جميع شروط التجاهل"""
     ignore_reasons = []
     
-    # الحصول على إعدادات الفلترة
     filters = config.get('FILTERS', {
         'max_length': 50,
         'block_links': True,
@@ -97,31 +103,25 @@ def should_ignore_message(message_text, config):
     banned_ads = config.get('BANNED_ADS', [])
     suspicious_words = config.get('SUSPICIOUS_WORDS', [])
     
-    # شرط 1: عدد الأحرف
     if filters.get('max_length', 50) > 0:
         max_len = filters.get('max_length', 50)
         if is_too_long(message_text, max_len):
-            ignore_reasons.append(f"⚠️ تجاوز {max_len} حرفاً ({len(message_text.strip())} حرف)")
+            ignore_reasons.append(f"تجاوز {max_len} حرفاً ({len(message_text.strip())} حرف)")
     
-    # شرط 2: يحتوي على رابط
     if filters.get('block_links', True) and contains_link(message_text):
-        ignore_reasons.append("❌ يحتوي على رابط")
+        ignore_reasons.append("يحتوي على رابط")
     
-    # شرط 3: يحتوي على رقم هاتف
     if filters.get('block_phones', True) and contains_phone(message_text):
-        ignore_reasons.append("❌ يحتوي على رقم هاتف")
+        ignore_reasons.append("يحتوي على رقم هاتف")
     
-    # شرط 4: يحتوي على معرف
     if filters.get('block_mentions', True) and contains_mention(message_text):
-        ignore_reasons.append("❌ يحتوي على معرف @")
+        ignore_reasons.append("يحتوي على معرف @")
     
-    # شرط 5: رسالة إعلانية (كلمات محظورة)
     if filters.get('block_ads', True) and banned_ads and is_announcement(message_text, banned_ads):
-        ignore_reasons.append("📢 رسالة إعلانية (كلمة محظورة)")
+        ignore_reasons.append("رسالة إعلانية (كلمة محظورة)")
     
-    # شرط 6: كلمات مشبوهة
     if filters.get('block_suspicious', True) and suspicious_words and contains_suspicious_words(message_text, suspicious_words):
-        ignore_reasons.append("⚠️ يحتوي على كلمات مشبوهة")
+        ignore_reasons.append("يحتوي على كلمات مشبوهة")
     
     return ignore_reasons
 
@@ -141,13 +141,41 @@ async def import_groups(client):
     update_json_config(config)
     return new_groups_count
 
+# ============ الحذف التلقائي ============
+
+async def auto_delete_task():
+    """مهمة خلفية لحذف الرسائل المحولة من القناة بعد مرور عدد ساعات محدد"""
+    global message_map
+    while True:
+        try:
+            config = load_json_config()
+            auto_delete_hours = config.get('AUTO_DELETE_HOURS', 0)
+            if auto_delete_hours > 0:
+                current_time = time.time()
+                to_delete = []
+                for msg_id, info in list(message_map.items()):
+                    msg_time = info.get('timestamp', 0)
+                    if current_time - msg_time >= auto_delete_hours * 3600:
+                        to_delete.append(msg_id)
+                
+                for msg_id in to_delete:
+                    try:
+                        await bot.delete_messages(CHANNEL_ID, msg_id)
+                        del message_map[msg_id]
+                        logger.info(f"تم حذف الرسالة {msg_id} من القناة تلقائياً")
+                    except Exception as e:
+                        logger.error(f"خطأ في حذف الرسالة {msg_id}: {e}")
+        except Exception as e:
+            logger.error(f"خطأ في مهمة الحذف التلقائي: {e}")
+        
+        await asyncio.sleep(300)
+
 async def start_monitoring(client, phone):
     """بدء مراقبة الرسائل للحساب المرتبط - يراقب جميع المجموعات تلقائياً بدون استثناء"""
     
-    # إضافة مهمة دورية للحفاظ على الاتصال (Keep-Alive)
     async def keep_connection_alive():
         while True:
-            await asyncio.sleep(300)  # كل 5 دقائق
+            await asyncio.sleep(300)
             try:
                 await client.get_me()
                 logger.info(f"✅ تم إرسال إشارة البقاء على قيد الحياة للحساب {phone}")
@@ -164,32 +192,52 @@ async def start_monitoring(client, phone):
     
     @client.on(events.NewMessage())
     async def handler(event):
+        global message_map, seen_messages
         config = load_json_config()
         keywords = config.get('KEYWORDS', [])
         ignore_users = config.get('IGNORE_USERS', [])
         
-        # ===== التعديل الأساسي: إلغاء شرط target_groups بالكامل =====
-        # أصبح البوت يراقب كل المجموعات التي فيها الحساب تلقائياً
         if event.is_group:
-            # التحقق من تجاهل المستخدم
             sender_id = event.sender_id
             if sender_id in ignore_users:
                 return
             
             message_text = event.message.message or ""
             
-            # تطبيق شروط الفلترة
             ignore_reasons = should_ignore_message(message_text, config)
             
             if ignore_reasons:
                 logger.info(f"تم تجاهل رسالة من {phone}: {', '.join(ignore_reasons)}")
                 return
             
+            # ===== كشف التكرار =====
+            if config.get('DUPLICATE_DETECTION', True):
+                msg_key = f"{event.chat_id}_{event.id}_{sender_id}"
+                if msg_key in seen_messages:
+                    logger.info(f"تم تجاهل رسالة مكررة من {phone}")
+                    return
+                seen_messages.add(msg_key)
+            
             # التحقق من الكلمات المفتاحية
-            if any(kw.lower() in message_text.lower() for kw in keywords):
+            matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
+            if matched_keywords:
                 try:
                     chat = await event.get_chat()
                     chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
+                    
+                    # الحصول على اسم المرسل
+                    sender_name = ""
+                    try:
+                        sender = await event.get_sender()
+                        if sender:
+                            if getattr(sender, 'first_name', None):
+                                sender_name = sender.first_name
+                                if getattr(sender, 'last_name', None):
+                                    sender_name += f" {sender.last_name}"
+                            if getattr(sender, 'username', None):
+                                sender_name += f" (@{sender.username})"
+                    except:
+                        pass
                     
                     link = ""
                     if event.chat:
@@ -199,16 +247,71 @@ async def start_monitoring(client, phone):
                             c_id = str(event.chat_id).replace('-100', '')
                             link = f"https://t.me/c/{c_id}/{event.id}"
                     
+                    matched_keyword = matched_keywords[0]
+                    
+                    # ===== عرض الحساب المراقب الذي جاءت منه الرسالة =====
                     forward_text = (
                         f"📢 **تم العثور على رسالة مطابقة!**\n\n"
                         f"👥 **المجموعة:** {chat_title}\n"
-                        f"👤 **معرف المرسل:** `{sender_id}`\n"
+                        f"👤 **المرسل:** {sender_name if sender_name else 'مستخدم'} (`{sender_id}`)\n"
+                        f"📱 **الحساب المراقب:** `{phone}`\n"
+                        f"🔑 **الكلمة المطابقة:** `{matched_keyword}`\n"
                         f"📝 **الرسالة:**\n{message_text}\n"
                     )
                     
-                    buttons = [[Button.url("عرض الرسالة الأصلية", url=link)]] if link else None
-                    await bot.send_message(CHANNEL_ID, forward_text, buttons=buttons)
+                    # ===== أزرار الرد المنفصلة + زر إضافة رد مباشر =====
+                    all_buttons = []
+                    
+                    # صف أزرار الرد (خاص + قروب)
+                    reply_row = []
+                    dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+                    if dm_templates:
+                        reply_row.append(Button.inline("💬 رد خاص", f"dm_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
+                    grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+                    if grp_templates:
+                        reply_row.append(Button.inline("👥 رد قروب", f"grp_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
+                    if reply_row:
+                        all_buttons.append(reply_row)
+                    
+                    # صف زر إضافة رد مباشر من القناة
+                    add_reply_row = [
+                        Button.inline("➕ إضافة رد خاص", f"add_dm_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode()),
+                        Button.inline("➕ إضافة رد قروب", f"add_grp_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode())
+                    ]
+                    all_buttons.append(add_reply_row)
+                    
+                    # زر عرض الرسالة الأصلية
+                    if link:
+                        all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
+                    
+                    sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
+                    
+                    # حفظ بيانات الرسالة للرد لاحقاً
+                    message_map[sent_msg.id] = {
+                        "group_id": event.chat_id,
+                        "message_id": event.id,
+                        "sender_id": sender_id,
+                        "phone": phone,
+                        "timestamp": time.time()
+                    }
+                    
                     logger.info(f"تم توجيه رسالة من الحساب {phone}")
+                    
+                    # ===== الرد التلقائي بالقروب =====
+                    auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
+                    for kw in matched_keywords:
+                        if kw in auto_reply_settings:
+                            try:
+                                await client.send_message(
+                                    event.chat_id,
+                                    auto_reply_settings[kw],
+                                    reply_to=event.id
+                                )
+                                logger.info(f"تم إرسال رد تلقائي للكلمة '{kw}' في القروب")
+                            except Exception as e:
+                                logger.error(f"خطأ في إرسال الرد التلقائي: {e}")
+                            break
+                    
                 except Exception as e:
                     logger.error(f"خطأ في توجيه الرسالة: {e}")
 
@@ -226,7 +329,10 @@ async def setup_bot_handlers():
             [Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')],
             [Button.inline('👥 المجموعات المستهدفة', b'manage_groups'), Button.inline('❌ حذف حساب', b'rem_acc')],
             [Button.inline('🛡️ كلمات محظورة ومشبوهة', b'manage_banned')],
-            [Button.inline('⚙️ إعدادات الفلترة', b'manage_filters')]
+            [Button.inline('⚙️ إعدادات الفلترة', b'manage_filters')],
+            [Button.inline('💬 قوالب الرد على الخاص', b'manage_dm_templates'), Button.inline('👥 قوالب الرد في القروب', b'manage_grp_templates')],
+            [Button.inline('📨 الرد التلقائي', b'manage_auto_reply')],
+            [Button.inline('🔄 كشف التكرار والحذف التلقائي', b'manage_advanced')]
         ]
         await event.respond('👋 **أهلاً بك في مدير مراقبة تيليجرام**\n\nتحكم في حساباتك وإعدادات المراقبة من هنا:', buttons=buttons)
 
@@ -286,7 +392,7 @@ async def setup_bot_handlers():
                 for phone, client in active_clients.items():
                     new = await import_groups(client)
                     total_new += new
-                await event.respond(f"✅ تم تحديث القائمة! تم استيراد `{total_new}` مجموعة جديدة (هذه القائمة للعرض فقط، والمراقبة تشمل جميع المجموعات).")
+                await event.respond(f"✅ تم تحديث القائمة! تم استيراد `{total_new}` مجموعة جديدة.")
 
         # ============ حذف حساب ============
         
@@ -322,20 +428,18 @@ async def setup_bot_handlers():
             msg += "\n".join([f"- `{w}`" for w in suspicious]) if suspicious else "- (لا توجد كلمات)"
             
             buttons = [
-                [Button.inline('📢 إضافة كلمة إعلانية محظورة', b'add_banned_ad')],
-                [Button.inline('📢 حذف كلمة إعلانية محظورة', b'rem_banned_ad')],
+                [Button.inline('📢 إضافة كلمة إعلانية', b'add_banned_ad')],
+                [Button.inline('📢 حذف كلمة إعلانية', b'rem_banned_ad')],
                 [Button.inline('⚠️ إضافة كلمة مشبوهة', b'add_suspicious')],
                 [Button.inline('⚠️ حذف كلمة مشبوهة', b'rem_suspicious')],
                 [Button.inline('🔙 رجوع', b'back_main')]
             ]
             await event.respond(msg, buttons=buttons)
         
-        # إضافة كلمة إعلانية محظورة
         elif data == b'add_banned_ad':
             login_states[user_id] = {'step': 'add_banned_ad'}
-            await event.respond("📝 أرسل الكلمة الإعلانية التي تريد حظرها (مثال: عرض, خصم, سعر):")
+            await event.respond("📝 أرسل الكلمة الإعلانية التي تريد حظرها:")
         
-        # حذف كلمة إعلانية محظورة
         elif data == b'rem_banned_ad':
             banned_ads = config.get('BANNED_ADS', [])
             if not banned_ads:
@@ -353,16 +457,14 @@ async def setup_bot_handlers():
                 banned_ads.remove(word)
                 config['BANNED_ADS'] = banned_ads
                 update_json_config(config)
-                await event.respond(f"✅ تم حذف الكلمة `{word}` من قائمة الكلمات الإعلانية المحظورة.")
+                await event.respond(f"✅ تم حذف الكلمة `{word}` من قائمة المحظورة.")
             else:
                 await event.respond("❌ الكلمة غير موجودة.")
         
-        # إضافة كلمة مشبوهة
         elif data == b'add_suspicious':
             login_states[user_id] = {'step': 'add_suspicious'}
-            await event.respond("📝 أرسل الكلمة المشبوهة التي تريد حظرها (مثال: احتيال, نصبة, فيروس):")
+            await event.respond("📝 أرسل الكلمة المشبوهة التي تريد حظرها:")
         
-        # حذف كلمة مشبوهة
         elif data == b'rem_suspicious':
             suspicious = config.get('SUSPICIOUS_WORDS', [])
             if not suspicious:
@@ -380,21 +482,14 @@ async def setup_bot_handlers():
                 suspicious.remove(word)
                 config['SUSPICIOUS_WORDS'] = suspicious
                 update_json_config(config)
-                await event.respond(f"✅ تم حذف الكلمة `{word}` من قائمة الكلمات المشبوهة.")
+                await event.respond(f"✅ تم حذف الكلمة `{word}` من قائمة المشبوهة.")
             else:
                 await event.respond("❌ الكلمة غير موجودة.")
 
         # ============ إعدادات الفلترة ============
         
         elif data == b'manage_filters':
-            filters = config.get('FILTERS', {
-                'max_length': 50,
-                'block_links': True,
-                'block_phones': True,
-                'block_mentions': True,
-                'block_ads': True,
-                'block_suspicious': True
-            })
+            filters = config.get('FILTERS', {})
             
             msg = "⚙️ **إعدادات الفلترة**\n\n"
             msg += f"📏 الحد الأقصى للأحرف: `{filters.get('max_length', 50)}`\n"
@@ -415,7 +510,6 @@ async def setup_bot_handlers():
             ]
             await event.respond(msg, buttons=buttons)
         
-        # تبديل الإعدادات
         elif data == b'set_max_length':
             login_states[user_id] = {'step': 'set_max_length'}
             await event.respond("📏 أرسل الحد الأقصى الجديد لعدد الأحرف (رقم بين 10 و 500):")
@@ -455,6 +549,297 @@ async def setup_bot_handlers():
             update_json_config(config)
             await event.respond(f"✅ تم {'تفعيل' if filters['block_suspicious'] else 'تعطيل'} منع الكلمات المشبوهة.")
         
+        # ============ قوالب الرد على الخاص ============
+        
+        elif data == b'manage_dm_templates':
+            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            msg = "💬 **قوالب الرد على الخاص**\n\n"
+            if dm_templates:
+                for i, t in enumerate(dm_templates, 1):
+                    preview = t[:50] + "..." if len(t) > 50 else t
+                    msg += f"{i}. `{preview}`\n"
+            else:
+                msg += "لا توجد قوالب حالياً."
+            
+            buttons = [
+                [Button.inline('➕ إضافة قالب', b'add_dm_template')],
+                [Button.inline('➖ حذف قالب', b'rem_dm_template')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ]
+            await event.respond(msg, buttons=buttons)
+        
+        elif data == b'add_dm_template':
+            login_states[user_id] = {'step': 'add_dm_template'}
+            await event.respond("📝 أرسل نص قالب الرد على الخاص:\n\n(سيتم إرسال هذا النص كرسالة خاصة للمرسل عند اختيار هذا القالب)")
+        
+        elif data == b'rem_dm_template':
+            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            if not dm_templates:
+                await event.respond("❌ لا توجد قوالب لحذفها.")
+            else:
+                buttons = []
+                for i, t in enumerate(dm_templates):
+                    preview = t[:30] + "..." if len(t) > 30 else t
+                    buttons.append([Button.inline(f"🗑 {preview}", f"del_dm_tpl_{i}".encode())])
+                buttons.append([Button.inline('🔙 رجوع', b'manage_dm_templates')])
+                await event.respond("اختر القالب الذي تريد حذفه:", buttons=buttons)
+        
+        elif data.startswith(b'del_dm_tpl_'):
+            idx = int(data.decode().replace('del_dm_tpl_', ''))
+            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            if 0 <= idx < len(dm_templates):
+                removed = dm_templates.pop(idx)
+                config['DM_REPLY_TEMPLATES'] = dm_templates
+                update_json_config(config)
+                preview = removed[:40] + "..." if len(removed) > 40 else removed
+                await event.respond(f"✅ تم حذف القالب: `{preview}`")
+            else:
+                await event.respond("❌ القالب غير موجود.")
+        
+        # ============ قوالب الرد في القروب ============
+        
+        elif data == b'manage_grp_templates':
+            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            msg = "👥 **قوالب الرد في القروب**\n\n"
+            if grp_templates:
+                for i, t in enumerate(grp_templates, 1):
+                    preview = t[:50] + "..." if len(t) > 50 else t
+                    msg += f"{i}. `{preview}`\n"
+            else:
+                msg += "لا توجد قوالب حالياً."
+            
+            buttons = [
+                [Button.inline('➕ إضافة قالب', b'add_grp_template')],
+                [Button.inline('➖ حذف قالب', b'rem_grp_template')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ]
+            await event.respond(msg, buttons=buttons)
+        
+        elif data == b'add_grp_template':
+            login_states[user_id] = {'step': 'add_grp_template'}
+            await event.respond("📝 أرسل نص قالب الرد في القروب:\n\n(سيتم إرسال هذا النص كرد في القروب على رسالة المرسل عند اختيار هذا القالب)")
+        
+        elif data == b'rem_grp_template':
+            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            if not grp_templates:
+                await event.respond("❌ لا توجد قوالب لحذفها.")
+            else:
+                buttons = []
+                for i, t in enumerate(grp_templates):
+                    preview = t[:30] + "..." if len(t) > 30 else t
+                    buttons.append([Button.inline(f"🗑 {preview}", f"del_grp_tpl_{i}".encode())])
+                buttons.append([Button.inline('🔙 رجوع', b'manage_grp_templates')])
+                await event.respond("اختر القالب الذي تريد حذفه:", buttons=buttons)
+        
+        elif data.startswith(b'del_grp_tpl_'):
+            idx = int(data.decode().replace('del_grp_tpl_', ''))
+            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            if 0 <= idx < len(grp_templates):
+                removed = grp_templates.pop(idx)
+                config['GROUP_REPLY_TEMPLATES'] = grp_templates
+                update_json_config(config)
+                preview = removed[:40] + "..." if len(removed) > 40 else removed
+                await event.respond(f"✅ تم حذف القالب: `{preview}`")
+            else:
+                await event.respond("❌ القالب غير موجود.")
+        
+        # ============ إضافة رد مباشر من القناة - خاص ============
+        
+        elif data.startswith(b'add_dm_from_ch_'):
+            parts = data.decode().split('_')
+            # add_dm_from_ch_{group_id}_{message_id}_{sender_id}
+            if len(parts) >= 6:
+                group_id = int(parts[4])
+                message_id = int(parts[5])
+                sender_id = int(parts[6])
+                login_states[user_id] = {
+                    'step': 'add_dm_from_ch',
+                    'group_id': group_id,
+                    'message_id': message_id,
+                    'sender_id': sender_id
+                }
+                await event.respond("📝 أرسل نص رد الخاص الذي تريد إضافته كقالب وإرساله للمرسل:\n\n(سيتم حفظه في القوالب وإرساله مباشرة)")
+        
+        # ============ إضافة رد مباشر من القناة - قروب ============
+        
+        elif data.startswith(b'add_grp_from_ch_'):
+            parts = data.decode().split('_')
+            # add_grp_from_ch_{group_id}_{message_id}_{sender_id}
+            if len(parts) >= 6:
+                group_id = int(parts[4])
+                message_id = int(parts[5])
+                sender_id = int(parts[6])
+                login_states[user_id] = {
+                    'step': 'add_grp_from_ch',
+                    'group_id': group_id,
+                    'message_id': message_id,
+                    'sender_id': sender_id
+                }
+                await event.respond("📝 أرسل نص رد القروب الذي تريد إضافته كقالب وإرساله:\n\n(سيتم حفظه في القوالب وإرساله مباشرة كرد في القروب)")
+        
+        # ============ الرد على الخاص (اختيار القالب) ============
+        
+        elif data.startswith(b'dm_reply_'):
+            parts = data.decode().split('_')
+            # dm_reply_{group_id}_{message_id}_{sender_id}
+            if len(parts) >= 5:
+                group_id = int(parts[2])
+                message_id = int(parts[3])
+                sender_id = int(parts[4])
+                
+                dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+                if not dm_templates:
+                    await event.respond("❌ لا توجد قوالب للرد على الخاص. أضف قالب أولاً من زر ➕ إضافة رد خاص.")
+                    return
+                
+                if len(dm_templates) == 1:
+                    template_text = dm_templates[0]
+                    await send_dm_reply(event, group_id, message_id, sender_id, template_text)
+                else:
+                    buttons = []
+                    for i, t in enumerate(dm_templates):
+                        preview = t[:30] + "..." if len(t) > 30 else t
+                        buttons.append([Button.inline(f"💬 {preview}", f"send_dm_{group_id}_{message_id}_{sender_id}_{i}".encode())])
+                    buttons.append([Button.inline('❌ إلغاء', b'cancel_reply')])
+                    await event.respond("اختر قالب الرد على الخاص:", buttons=buttons)
+        
+        elif data.startswith(b'send_dm_'):
+            parts = data.decode().split('_')
+            # send_dm_{group_id}_{message_id}_{sender_id}_{template_index}
+            if len(parts) >= 6:
+                group_id = int(parts[2])
+                message_id = int(parts[3])
+                sender_id = int(parts[4])
+                tpl_idx = int(parts[5])
+                
+                dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+                if 0 <= tpl_idx < len(dm_templates):
+                    template_text = dm_templates[tpl_idx]
+                    await send_dm_reply(event, group_id, message_id, sender_id, template_text)
+                else:
+                    await event.respond("❌ القالب غير موجود.")
+        
+        # ============ الرد في القروب (اختيار القالب) ============
+        
+        elif data.startswith(b'grp_reply_'):
+            parts = data.decode().split('_')
+            # grp_reply_{group_id}_{message_id}_{sender_id}
+            if len(parts) >= 5:
+                group_id = int(parts[2])
+                message_id = int(parts[3])
+                sender_id = int(parts[4])
+                
+                grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+                if not grp_templates:
+                    await event.respond("❌ لا توجد قوالب للرد في القروب. أضف قالب أولاً من زر ➕ إضافة رد قروب.")
+                    return
+                
+                if len(grp_templates) == 1:
+                    template_text = grp_templates[0]
+                    await send_group_reply(event, group_id, message_id, sender_id, template_text)
+                else:
+                    buttons = []
+                    for i, t in enumerate(grp_templates):
+                        preview = t[:30] + "..." if len(t) > 30 else t
+                        buttons.append([Button.inline(f"👥 {preview}", f"send_grp_{group_id}_{message_id}_{sender_id}_{i}".encode())])
+                    buttons.append([Button.inline('❌ إلغاء', b'cancel_reply')])
+                    await event.respond("اختر قالب الرد في القروب:", buttons=buttons)
+        
+        elif data.startswith(b'send_grp_'):
+            parts = data.decode().split('_')
+            # send_grp_{group_id}_{message_id}_{sender_id}_{template_index}
+            if len(parts) >= 6:
+                group_id = int(parts[2])
+                message_id = int(parts[3])
+                sender_id = int(parts[4])
+                tpl_idx = int(parts[5])
+                
+                grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+                if 0 <= tpl_idx < len(grp_templates):
+                    template_text = grp_templates[tpl_idx]
+                    await send_group_reply(event, group_id, message_id, sender_id, template_text)
+                else:
+                    await event.respond("❌ القالب غير موجود.")
+        
+        elif data == b'cancel_reply':
+            await event.respond("❌ تم إلغاء الرد.")
+        
+        # ============ الرد التلقائي ============
+        
+        elif data == b'manage_auto_reply':
+            auto_reply = config.get('AUTO_REPLY_SETTINGS', {})
+            msg = "📨 **إعدادات الرد التلقائي**\n\n"
+            if auto_reply:
+                for kw, reply in auto_reply.items():
+                    preview = reply[:40] + "..." if len(reply) > 40 else reply
+                    msg += f"🔑 `{kw}` → 💬 `{preview}`\n"
+            else:
+                msg += "لا توجد ردود تلقائية محددة.\n\n"
+                msg += "💡 عند إضافة رد تلقائي، سيتم إرساله كرد في القروب تلقائياً عند مطابقة الكلمة المفتاحية."
+            
+            buttons = [
+                [Button.inline('➕ إضافة رد تلقائي', b'add_auto_reply')],
+                [Button.inline('➖ حذف رد تلقائي', b'rem_auto_reply')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ]
+            await event.respond(msg, buttons=buttons)
+        
+        elif data == b'add_auto_reply':
+            login_states[user_id] = {'step': 'add_auto_reply_keyword'}
+            await event.respond("📝 أرسل **الكلمة المفتاحية** التي تريد الرد عليها تلقائياً:")
+        
+        elif data == b'rem_auto_reply':
+            auto_reply = config.get('AUTO_REPLY_SETTINGS', {})
+            if not auto_reply:
+                await event.respond("❌ لا توجد ردود تلقائية لحذفها.")
+            else:
+                buttons = []
+                for kw, reply in auto_reply.items():
+                    preview = reply[:25] + "..." if len(reply) > 25 else reply
+                    buttons.append([Button.inline(f"🗑 {kw} → {preview}", f"del_auto_{kw}".encode())])
+                buttons.append([Button.inline('🔙 رجوع', b'manage_auto_reply')])
+                await event.respond("اختر الرد التلقائي الذي تريد حذفه:", buttons=buttons)
+        
+        elif data.startswith(b'del_auto_'):
+            keyword = data.decode().replace('del_auto_', '')
+            auto_reply = config.get('AUTO_REPLY_SETTINGS', {})
+            if keyword in auto_reply:
+                del auto_reply[keyword]
+                config['AUTO_REPLY_SETTINGS'] = auto_reply
+                update_json_config(config)
+                await event.respond(f"✅ تم حذف الرد التلقائي للكلمة `{keyword}`.")
+            else:
+                await event.respond("❌ الكلمة غير موجودة.")
+        
+        # ============ كشف التكرار والحذف التلقائي ============
+        
+        elif data == b'manage_advanced':
+            dup_detection = config.get('DUPLICATE_DETECTION', True)
+            auto_delete = config.get('AUTO_DELETE_HOURS', 0)
+            
+            msg = "🔄 **إعدادات متقدمة**\n\n"
+            msg += f"🔍 كشف التكرار: `{'✅ مفعل' if dup_detection else '❌ معطل'}`\n"
+            msg += f"⏰ الحذف التلقائي: `{'كل ' + str(auto_delete) + ' ساعة/ساعات' if auto_delete > 0 else '❌ معطل'}`\n\n"
+            msg += "💡 **كشف التكرار:** يمنع توجيه نفس الرسالة مرتين\n"
+            msg += "💡 **الحذف التلقائي:** يحذف الرسائل المحولة من القناة بعد عدد ساعات محدد"
+            
+            buttons = [
+                [Button.inline('🔍 تبديل كشف التكرار', b'toggle_duplicate')],
+                [Button.inline('⏰ تعيين الحذف التلقائي', b'set_auto_delete')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ]
+            await event.respond(msg, buttons=buttons)
+        
+        elif data == b'toggle_duplicate':
+            current = config.get('DUPLICATE_DETECTION', True)
+            config['DUPLICATE_DETECTION'] = not current
+            update_json_config(config)
+            await event.respond(f"✅ تم {'تفعيل' if not current else 'تعطيل'} كشف التكرار.")
+        
+        elif data == b'set_auto_delete':
+            login_states[user_id] = {'step': 'set_auto_delete'}
+            await event.respond("⏰ أرسل عدد الساعات للحذف التلقائي (0 للتعطيل):")
+        
         # رجوع للقائمة الرئيسية
         elif data == b'back_main':
             await start_handler(event)
@@ -463,6 +848,63 @@ async def setup_bot_handlers():
         elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
             login_states[user_id] = {'step': data.decode()}
             await event.respond(f"📝 من فضلك أرسل القيمة التي تريد تنفيذ الإجراء عليها:")
+
+    # ============ دوال إرسال الرد ============
+    
+    async def send_dm_reply(event, group_id, message_id, sender_id, template_text):
+        """إرسال رد على الخاص للمرسل"""
+        try:
+            target_client = None
+            for phone, client in active_clients.items():
+                try:
+                    await client.get_entity(group_id)
+                    target_client = client
+                    break
+                except:
+                    continue
+            
+            if not target_client:
+                await event.respond("❌ لا يوجد حساب مرتبط يمكنه الرد في هذه المجموعة.")
+                return
+            
+            try:
+                sender_entity = await target_client.get_entity(sender_id)
+                await target_client.send_message(sender_entity, template_text)
+                preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
+                await event.respond(f"✅ تم إرسال الرد على الخاص:\n\n💬 `{preview}`")
+                logger.info(f"تم إرسال رد خاص للمرسل {sender_id}")
+            except Exception as e:
+                await event.respond(f"❌ فشل إرسال الرسالة الخاصة. قد يكون المرسل قد أغلق الخاص.\n\nالخطأ: {str(e)[:100]}")
+                logger.error(f"خطأ في إرسال رد خاص: {e}")
+        
+        except Exception as e:
+            await event.respond(f"❌ خطأ في إرسال الرد: {str(e)[:100]}")
+            logger.error(f"خطأ في send_dm_reply: {e}")
+    
+    async def send_group_reply(event, group_id, message_id, sender_id, template_text):
+        """إرسال رد في القروب كرد على رسالة المرسل"""
+        try:
+            target_client = None
+            for phone, client in active_clients.items():
+                try:
+                    await client.get_entity(group_id)
+                    target_client = client
+                    break
+                except:
+                    continue
+            
+            if not target_client:
+                await event.respond("❌ لا يوجد حساب مرتبط يمكنه الرد في هذه المجموعة.")
+                return
+            
+            await target_client.send_message(group_id, template_text, reply_to=message_id)
+            preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
+            await event.respond(f"✅ تم إرسال الرد في القروب:\n\n👥 `{preview}`")
+            logger.info(f"تم إرسال رد في القروب {group_id} على رسالة {message_id}")
+        
+        except Exception as e:
+            await event.respond(f"❌ خطأ في إرسال الرد في القروب: {str(e)[:100]}")
+            logger.error(f"خطأ في send_group_reply: {e}")
 
     # ============ معالج الإدخال النصي ============
     
@@ -494,7 +936,7 @@ async def setup_bot_handlers():
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
                 
                 new_count = await import_groups(client)
-                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (هذه القائمة للعرض فقط، والمراقبة تشمل جميع المجموعات).")
+                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
                 
                 active_clients[state['phone']] = client
                 asyncio.create_task(start_monitoring(client, state['phone']))
@@ -510,10 +952,7 @@ async def setup_bot_handlers():
             try:
                 client = state['client']
                 await client.sign_in(password=text)
-                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
-                
-                new_count = await import_groups(client)
-                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (هذه القائمة للعرض فقط، والمراقبة تشمل جميع المجموعات).")
+                await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
                 active_clients[state['phone']] = client
                 asyncio.create_task(start_monitoring(client, state['phone']))
@@ -549,7 +988,7 @@ async def setup_bot_handlers():
                 await event.respond(f"✅ تم حذف المعرف `{text}` من قائمة التجاهل."); del login_states[user_id]
             except: await event.respond("❌ المعرف غير صحيح.")
 
-        # إضافة مجموعة يدوي (للعرض فقط)
+        # إضافة مجموعة يدوي
         elif state['step'] == 'add_group':
             try:
                 group_id = int(text)
@@ -558,14 +997,14 @@ async def setup_bot_handlers():
                     groups.append(group_id)
                     config['TARGET_GROUPS'] = groups
                     update_json_config(config)
-                    await event.respond(f"✅ تم إضافة المجموعة `{group_id}` (للعرض فقط، المراقبة تشمل الكل).")
+                    await event.respond(f"✅ تم إضافة المجموعة `{group_id}`.")
                 else:
                     await event.respond("⚠️ المجموعة موجودة بالفعل.")
             except:
                 await event.respond("❌ المعرف غير صحيح.")
             del login_states[user_id]
 
-        # حذف مجموعة يدوي (للعرض فقط)
+        # حذف مجموعة يدوي
         elif state['step'] == 'rem_group':
             try:
                 group_id = int(text)
@@ -574,7 +1013,7 @@ async def setup_bot_handlers():
                     groups.remove(group_id)
                     config['TARGET_GROUPS'] = groups
                     update_json_config(config)
-                    await event.respond(f"✅ تم حذف المجموعة `{group_id}` من قائمة العرض.")
+                    await event.respond(f"✅ تم حذف المجموعة `{group_id}`.")
                 else:
                     await event.respond("⚠️ المجموعة غير موجودة.")
             except:
@@ -590,7 +1029,7 @@ async def setup_bot_handlers():
                 update_json_config(config)
                 await event.respond(f"✅ تم إضافة الكلمة الإعلانية المحظورة: `{text}`")
             else:
-                await event.respond(f"⚠️ الكلمة `{text}` موجودة بالفعل في القائمة.")
+                await event.respond(f"⚠️ الكلمة `{text}` موجودة بالفعل.")
             del login_states[user_id]
 
         # إضافة كلمة مشبوهة
@@ -602,7 +1041,7 @@ async def setup_bot_handlers():
                 update_json_config(config)
                 await event.respond(f"✅ تم إضافة الكلمة المشبوهة: `{text}`")
             else:
-                await event.respond(f"⚠️ الكلمة `{text}` موجودة بالفعل في القائمة.")
+                await event.respond(f"⚠️ الكلمة `{text}` موجودة بالفعل.")
             del login_states[user_id]
 
         # تغيير الحد الأقصى للأحرف
@@ -621,6 +1060,95 @@ async def setup_bot_handlers():
                 await event.respond("❌ من فضلك أرسل رقماً صحيحاً")
             del login_states[user_id]
 
+        # ============ إضافة قالب الرد على الخاص ============
+        elif state['step'] == 'add_dm_template':
+            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            dm_templates.append(text)
+            config['DM_REPLY_TEMPLATES'] = dm_templates
+            update_json_config(config)
+            preview = text[:50] + "..." if len(text) > 50 else text
+            await event.respond(f"✅ تم إضافة قالب الرد على الخاص:\n\n💬 `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة قالب الرد في القروب ============
+        elif state['step'] == 'add_grp_template':
+            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            grp_templates.append(text)
+            config['GROUP_REPLY_TEMPLATES'] = grp_templates
+            update_json_config(config)
+            preview = text[:50] + "..." if len(text) > 50 else text
+            await event.respond(f"✅ تم إضافة قالب الرد في القروب:\n\n👥 `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة رد مباشر من القناة - خاص ============
+        elif state['step'] == 'add_dm_from_ch':
+            group_id = state.get('group_id')
+            message_id = state.get('message_id')
+            sender_id = state.get('sender_id')
+            
+            # حفظ القالب
+            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            dm_templates.append(text)
+            config['DM_REPLY_TEMPLATES'] = dm_templates
+            update_json_config(config)
+            
+            # إرسال الرد مباشرة
+            await send_dm_reply(event, group_id, message_id, sender_id, text)
+            preview = text[:40] + "..." if len(text) > 40 else text
+            await event.respond(f"💾 تم حفظ القالب أيضاً في قوالب الرد على الخاص: `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة رد مباشر من القناة - قروب ============
+        elif state['step'] == 'add_grp_from_ch':
+            group_id = state.get('group_id')
+            message_id = state.get('message_id')
+            sender_id = state.get('sender_id')
+            
+            # حفظ القالب
+            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            grp_templates.append(text)
+            config['GROUP_REPLY_TEMPLATES'] = grp_templates
+            update_json_config(config)
+            
+            # إرسال الرد مباشرة
+            await send_group_reply(event, group_id, message_id, sender_id, text)
+            preview = text[:40] + "..." if len(text) > 40 else text
+            await event.respond(f"💾 تم حفظ القالب أيضاً في قوالب الرد في القروب: `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة رد تلقائي - الكلمة المفتاحية ============
+        elif state['step'] == 'add_auto_reply_keyword':
+            login_states[user_id] = {'step': 'add_auto_reply_message', 'keyword': text}
+            await event.respond(f"📝 الآن أرسل **نص الرد التلقائي** للكلمة `{text}`:")
+
+        # ============ إضافة رد تلقائي - نص الرسالة ============
+        elif state['step'] == 'add_auto_reply_message':
+            keyword = state.get('keyword', '')
+            auto_reply = config.get('AUTO_REPLY_SETTINGS', {})
+            auto_reply[keyword] = text
+            config['AUTO_REPLY_SETTINGS'] = auto_reply
+            update_json_config(config)
+            preview = text[:40] + "..." if len(text) > 40 else text
+            await event.respond(f"✅ تم إضافة رد تلقائي:\n\n🔑 `{keyword}` → 💬 `{preview}`")
+            del login_states[user_id]
+
+        # ============ تعيين الحذف التلقائي ============
+        elif state['step'] == 'set_auto_delete':
+            try:
+                hours = int(text)
+                if hours < 0:
+                    await event.respond("❌ الرقم يجب أن يكون 0 أو أكثر")
+                else:
+                    config['AUTO_DELETE_HOURS'] = hours
+                    update_json_config(config)
+                    if hours == 0:
+                        await event.respond("✅ تم تعطيل الحذف التلقائي.")
+                    else:
+                        await event.respond(f"✅ تم تعيين الحذف التلقائي كل `{hours}` ساعة/ساعات.")
+            except ValueError:
+                await event.respond("❌ من فضلك أرسل رقماً صحيحاً")
+            del login_states[user_id]
+
 async def main():
     global bot
     keep_alive()
@@ -628,6 +1156,9 @@ async def main():
     bot = TelegramClient('bot_session', API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
     await setup_bot_handlers()
+    
+    # بدء مهمة الحذف التلقائي
+    asyncio.create_task(auto_delete_task())
     
     # استئناف الجلسات الموجودة
     for f in os.listdir('.'):
