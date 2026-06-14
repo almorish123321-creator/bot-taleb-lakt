@@ -267,12 +267,8 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # أزرار الوصول للرسالة والقروب
-        access_row = []
-        if link:
-            access_row.append(Button.url("🔗 عرض الرسالة", url=link))
-        access_row.append(Button.inline("📩 انضم للقروب", f"join_grp_{event.chat_id}".encode()))
-        all_buttons.append(access_row)
+        # زر عرض الرسالة - يوديك للرسالة حتى لو لست عضو
+        all_buttons.append([Button.inline("🔗 عرض الرسالة", f"go_msg_{event.chat_id}_{event.id}".encode())])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
@@ -808,44 +804,54 @@ async def setup_bot_handlers():
         elif data == b'cancel_reply':
             await event.respond("❌ تم إلغاء الرد.")
         
-        # ============ الانضمام للقروب (حتى لو لست عضو) ============
+        # ============ عرض الرسالة - يوديك للرسالة حتى لو لست عضو ============
         
-        elif data.startswith(b'join_grp_'):
+        elif data.startswith(b'go_msg_'):
             parts = data.decode().split('_')
-            # join_grp_{group_id}
-            if len(parts) >= 3:
+            # go_msg_{group_id}_{message_id}
+            if len(parts) >= 4:
                 group_id = int(parts[2])
+                message_id = int(parts[3])
                 
-                await event.respond("🔄 جاري البحث عن رابط الدخول...")
+                await event.respond("🔄 جاري تجهيز الوصول للرسالة...")
                 
-                invite_link = None
                 chat_title = "غير معروف"
                 chat_username = None
+                invite_link = None
+                msg_link = None
                 
-                # محاولة الحصول على رابط الدعوة من الحسابات المراقبة
+                # محاولة من كل الحسابات المراقبة
                 for phone, client in active_clients.items():
                     try:
                         chat = await client.get_entity(group_id)
                         chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
+                        chat_username = getattr(chat, 'username', None)
                         
-                        # أولاً: إذا القروب عام (له يوزرنيم)
-                        if getattr(chat, 'username', None):
-                            chat_username = chat.username
-                            invite_link = f"https://t.me/{chat_username}"
+                        # رابط الرسالة المباشر
+                        if chat_username:
+                            msg_link = f"https://t.me/{chat_username}/{message_id}"
+                        else:
+                            c_id = str(group_id).replace('-100', '')
+                            msg_link = f"https://t.me/c/{c_id}/{message_id}"
+                        
+                        # إذا القروب عام - رابط الرسالة يكفي
+                        if chat_username:
                             break
                         
-                        # ثانياً: محاولة إنشاء رابط دعوة
+                        # إذا القروب خاص - نحتاج رابط دعوة
+                        # محاولة إنشاء رابط دعوة
                         try:
                             result = await client(ExportChatInviteRequest(group_id))
                             invite_link = result.link
                             break
                         except Exception:
-                            # ثالثاً: البحث عن رابط دعوة موجود مسبقاً
+                            # البحث عن رابط دعوة موجود
                             try:
                                 from telethon.tl.functions.messages import GetExportedChatInvitesRequest
+                                me = await client.get_me()
                                 invites = await client(GetExportedChatInvitesRequest(
                                     peer=group_id,
-                                    admin_id=await client.get_me(),
+                                    admin_id=me,
                                     limit=5
                                 ))
                                 for inv in invites.invites:
@@ -858,17 +864,28 @@ async def setup_bot_handlers():
                                 pass
                         
                     except Exception as e:
-                        logger.info(f"الحساب {phone} لا يستطيع إنشاء رابط لـ {group_id}: {e}")
+                        logger.info(f"الحساب {phone} لا يستطيع الوصول لـ {group_id}: {e}")
                         continue
                 
-                if invite_link:
-                    msg = f"📩 **رابط الدخول للقروب:** {chat_title}\n\n"
-                    msg += f"🔗 **الرابط:** {invite_link}\n\n"
-                    msg += "💡 اضغط الرابط فوق للانضمام ثم شاهد الرسالة."
-                    buttons = [[Button.url("🔗 افتح القروب", url=invite_link)]]
-                    await event.respond(msg, buttons=buttons)
+                # بناء الرد
+                if msg_link or invite_link:
+                    response = f"📨 **الوصول للرسالة في:** {chat_title}\n\n"
+                    
+                    if invite_link:
+                        response += f"1️⃣ انضم أولاً عبر الرابط:\n`{invite_link}`\n\n"
+                        response += f"2️⃣ بعد الانضمام، افتح الرسالة:\n`{msg_link}`\n\n"
+                        
+                        buttons = [
+                            [Button.url("📩 انضم للقروب", url=invite_link)],
+                            [Button.url("🔗 افتح الرسالة", url=msg_link)]
+                        ]
+                    else:
+                        response += f"🔗 اضغط لفتح الرسالة مباشرة:\n`{msg_link}`\n"
+                        buttons = [[Button.url("🔗 افتح الرسالة", url=msg_link)]]
+                    
+                    await event.respond(response, buttons=buttons)
                 else:
-                    await event.respond(f"❌ لم يتم العثور على رابط دخول للقروب **{chat_title}**.\n\n💡 القروب خاص ولا يوجد حساب مراقب لديه صلاحية إنشاء رابط دعوة.")
+                    await event.respond(f"❌ لم يتم العثور على طريقة للوصول للقروب **{chat_title}**.\n\n💡 القروب خاص ولا يوجد حساب مراقب لديه صلاحية إنشاء رابط دعوة.")
         
         # ============ الرد التلقائي ============
         
