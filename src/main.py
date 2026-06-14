@@ -267,9 +267,8 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر عرض الرسالة - رابط مباشر
-        if link:
-            all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
+        # زر عرض الرسالة - يوديك للرسالة حتى لو لست عضو
+        all_buttons.append([Button.inline("🔗 عرض الرسالة", f"go_msg_{event.chat_id}_{event.id}".encode())])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
@@ -827,12 +826,14 @@ async def setup_bot_handlers():
                 group_id = int(parts[2])
                 message_id = int(parts[3])
                 
-                await event.respond("🔄 جاري تجهيز الوصول للرسالة...")
-                
                 chat_title = "غير معروف"
                 chat_username = None
                 invite_link = None
                 msg_link = None
+                
+                # بناء رابط الرسالة الأساسي
+                c_id = str(group_id).replace('-100', '')
+                msg_link = f"https://t.me/c/{c_id}/{message_id}"
                 
                 # محاولة من كل الحسابات المراقبة
                 for phone, client in active_clients.items():
@@ -841,19 +842,17 @@ async def setup_bot_handlers():
                         chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
                         chat_username = getattr(chat, 'username', None)
                         
-                        # رابط الرسالة المباشر
+                        # إذا القروب عام - رابط مباشر يكفي
                         if chat_username:
                             msg_link = f"https://t.me/{chat_username}/{message_id}"
-                        else:
-                            c_id = str(group_id).replace('-100', '')
-                            msg_link = f"https://t.me/c/{c_id}/{message_id}"
-                        
-                        # إذا القروب عام - رابط الرسالة يكفي
-                        if chat_username:
-                            break
+                            # القروب عام = أي شخص يقدر يفتحه
+                            await event.respond(
+                                f"📨 **{chat_title}**\n🔗 اضغط لفتح الرسالة مباشرة:",
+                                buttons=[[Button.url("🔗 افتح الرسالة", url=msg_link)]]
+                            )
+                            return
                         
                         # إذا القروب خاص - نحتاج رابط دعوة
-                        # محاولة إنشاء رابط دعوة
                         try:
                             result = await client(ExportChatInviteRequest(group_id))
                             invite_link = result.link
@@ -882,22 +881,23 @@ async def setup_bot_handlers():
                         continue
                 
                 # بناء الرد
-                if msg_link or invite_link:
-                    response = f"📨 **الوصول للرسالة في:** {chat_title}\n\n"
-                    
-                    if invite_link:
-                        response += f"1️⃣ انضم أولاً عبر الرابط:\n`{invite_link}`\n\n"
-                        response += f"2️⃣ بعد الانضمام، افتح الرسالة:\n`{msg_link}`\n\n"
-                        
-                        buttons = [
+                if invite_link:
+                    # قروب خاص - نعطي رابط دعوة + رابط الرسالة
+                    await event.respond(
+                        f"📨 **{chat_title}** (قروب خاص)\n\n"
+                        f"1️⃣ انضم أولاً:\n"
+                        f"2️⃣ ثم افتح الرسالة:",
+                        buttons=[
                             [Button.url("📩 انضم للقروب", url=invite_link)],
                             [Button.url("🔗 افتح الرسالة", url=msg_link)]
                         ]
-                    else:
-                        response += f"🔗 اضغط لفتح الرسالة مباشرة:\n`{msg_link}`\n"
-                        buttons = [[Button.url("🔗 افتح الرسالة", url=msg_link)]]
-                    
-                    await event.respond(response, buttons=buttons)
+                    )
+                elif msg_link:
+                    # ما قدرنا نجيب رابط دعوة بس رابط الرسالة موجود
+                    await event.respond(
+                        f"📨 **{chat_title}**\n🔗 افتح الرسالة:",
+                        buttons=[[Button.url("🔗 افتح الرسالة", url=msg_link)]]
+                    )
                 else:
                     await event.respond(f"❌ لم يتم العثور على طريقة للوصول للقروب **{chat_title}**.\n\n💡 القروب خاص ولا يوجد حساب مراقب لديه صلاحية إنشاء رابط دعوة.")
         
