@@ -7,6 +7,7 @@ import time
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.tl.types import Chat, Channel
+from telethon.tl.functions.messages import ExportChatInviteRequest
 from flask import Flask
 from threading import Thread
 from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config
@@ -266,8 +267,12 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر جلب الرسالة الأصلية (يعمل حتى لو لست عضو في القروب)
-        all_buttons.append([Button.inline("🔗 عرض الرسالة الأصلية", f"view_msg_{event.chat_id}_{event.id}".encode())])
+        # أزرار الوصول للرسالة والقروب
+        access_row = []
+        if link:
+            access_row.append(Button.url("🔗 عرض الرسالة", url=link))
+        access_row.append(Button.inline("📩 انضم للقروب", f"join_grp_{event.chat_id}".encode()))
+        all_buttons.append(access_row)
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
@@ -803,94 +808,67 @@ async def setup_bot_handlers():
         elif data == b'cancel_reply':
             await event.respond("❌ تم إلغاء الرد.")
         
-        # ============ عرض الرسالة الأصلية (حتى لو لست عضو) ============
+        # ============ الانضمام للقروب (حتى لو لست عضو) ============
         
-        elif data.startswith(b'view_msg_'):
+        elif data.startswith(b'join_grp_'):
             parts = data.decode().split('_')
-            # view_msg_{group_id}_{message_id}
-            if len(parts) >= 4:
+            # join_grp_{group_id}
+            if len(parts) >= 3:
                 group_id = int(parts[2])
-                message_id = int(parts[3])
                 
-                await event.respond("🔄 جاري جلب الرسالة الأصلية...")
+                await event.respond("🔄 جاري البحث عن رابط الدخول...")
                 
-                found = False
-                # محاولة جلب الرسالة من كل الحسابات المراقبة
+                invite_link = None
+                chat_title = "غير معروف"
+                chat_username = None
+                
+                # محاولة الحصول على رابط الدعوة من الحسابات المراقبة
                 for phone, client in active_clients.items():
                     try:
-                        # محاولة جلب الرسالة من هذا الحساب
-                        messages = await client.get_messages(group_id, ids=message_id)
-                        if messages:
-                            msg = messages
-                            # جلب معلومات القروب
-                            chat = await client.get_entity(group_id)
-                            chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
-                            
-                            # جلب معلومات المرسل
-                            sender_info = ""
-                            try:
-                                sender = await client.get_entity(msg.sender_id)
-                                if sender:
-                                    sname = ""
-                                    if getattr(sender, 'first_name', None):
-                                        sname = sender.first_name
-                                        if getattr(sender, 'last_name', None):
-                                            sname += f" {sender.last_name}"
-                                    if getattr(sender, 'username', None):
-                                        sname += f" (@{sender.username})"
-                                    sender_info = sname if sname else f"مستخدم (`{msg.sender_id}`)"
-                                else:
-                                    sender_info = f"مستخدم (`{msg.sender_id}`)"
-                            except:
-                                sender_info = f"مستخدم (`{msg.sender_id}`)"
-                            
-                            # بناء رسالة العرض
-                            view_text = (
-                                f"📨 **الرسالة الأصلية**\n\n"
-                                f"👥 **القروب:** {chat_title}\n"
-                                f"👤 **المرسل:** {sender_info}\n"
-                                f"📱 **تم جلبها عبر الحساب:** `{phone}`\n"
-                                f"🕐 **التاريخ:** {msg.date.strftime('%Y-%m-%d %H:%M') if msg.date else 'غير معروف'}\n"
-                            )
-                            
-                            if msg.message:
-                                view_text += f"\n📝 **النص:**\n{msg.message}\n"
-                            
-                            if msg.media:
-                                media_type = "📷 صورة" if msg.photo else "📹 فيديو" if msg.video else "🎵 صوت" if msg.audio else "🎤 رسالة صوتية" if msg.voice else "📄 ملف" if msg.document else "📎 مرفق"
-                                view_text += f"\n📂 **يحتوي على:** {media_type}"
-                                
-                                # إرسال الميديا إن وجدت
-                                try:
-                                    # تحميل وإرسال الميديا عبر البوت
-                                    media_path = await client.download_media(msg, file=f"/tmp/media_{message_id}")
-                                    if media_path:
-                                        await bot.send_file(
-                                            user_id,
-                                            media_path,
-                                            caption=view_text
-                                        )
-                                        # حذف الملف المؤقت
-                                        try:
-                                            os.remove(media_path)
-                                        except:
-                                            pass
-                                        found = True
-                                        break
-                                except Exception as e:
-                                    logger.error(f"خطأ في إرسال الميديا: {e}")
-                                    view_text += f"\n⚠️ لم يتم تحميل المرفق: {str(e)[:50]}"
-                            
-                            # إرسال النص فقط (بدون ميديا أو فشل تحميل الميديا)
-                            await bot.send_message(user_id, view_text)
-                            found = True
+                        chat = await client.get_entity(group_id)
+                        chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
+                        
+                        # أولاً: إذا القروب عام (له يوزرنيم)
+                        if getattr(chat, 'username', None):
+                            chat_username = chat.username
+                            invite_link = f"https://t.me/{chat_username}"
                             break
+                        
+                        # ثانياً: محاولة إنشاء رابط دعوة
+                        try:
+                            result = await client(ExportChatInviteRequest(group_id))
+                            invite_link = result.link
+                            break
+                        except Exception:
+                            # ثالثاً: البحث عن رابط دعوة موجود مسبقاً
+                            try:
+                                from telethon.tl.functions.messages import GetExportedChatInvitesRequest
+                                invites = await client(GetExportedChatInvitesRequest(
+                                    peer=group_id,
+                                    admin_id=await client.get_me(),
+                                    limit=5
+                                ))
+                                for inv in invites.invites:
+                                    if not getattr(inv, 'revoked', False):
+                                        invite_link = inv.link
+                                        break
+                                if invite_link:
+                                    break
+                            except Exception:
+                                pass
+                        
                     except Exception as e:
-                        logger.info(f"الحساب {phone} لا يستطيع الوصول للرسالة: {e}")
+                        logger.info(f"الحساب {phone} لا يستطيع إنشاء رابط لـ {group_id}: {e}")
                         continue
                 
-                if not found:
-                    await event.respond("❌ لم يتم العثور على الرسالة. قد تكون حُذفت أو لا يوجد حساب مراقب يستطيع الوصول إليها.")
+                if invite_link:
+                    msg = f"📩 **رابط الدخول للقروب:** {chat_title}\n\n"
+                    msg += f"🔗 **الرابط:** {invite_link}\n\n"
+                    msg += "💡 اضغط الرابط فوق للانضمام ثم شاهد الرسالة."
+                    buttons = [[Button.url("🔗 افتح القروب", url=invite_link)]]
+                    await event.respond(msg, buttons=buttons)
+                else:
+                    await event.respond(f"❌ لم يتم العثور على رابط دخول للقروب **{chat_title}**.\n\n💡 القروب خاص ولا يوجد حساب مراقب لديه صلاحية إنشاء رابط دعوة.")
         
         # ============ الرد التلقائي ============
         
