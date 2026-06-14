@@ -266,9 +266,8 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر عرض الرسالة الأصلية
-        if link:
-            all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
+        # زر جلب الرسالة الأصلية (يعمل حتى لو لست عضو في القروب)
+        all_buttons.append([Button.inline("🔗 عرض الرسالة الأصلية", f"view_msg_{event.chat_id}_{event.id}".encode())])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
@@ -803,6 +802,95 @@ async def setup_bot_handlers():
         
         elif data == b'cancel_reply':
             await event.respond("❌ تم إلغاء الرد.")
+        
+        # ============ عرض الرسالة الأصلية (حتى لو لست عضو) ============
+        
+        elif data.startswith(b'view_msg_'):
+            parts = data.decode().split('_')
+            # view_msg_{group_id}_{message_id}
+            if len(parts) >= 4:
+                group_id = int(parts[2])
+                message_id = int(parts[3])
+                
+                await event.respond("🔄 جاري جلب الرسالة الأصلية...")
+                
+                found = False
+                # محاولة جلب الرسالة من كل الحسابات المراقبة
+                for phone, client in active_clients.items():
+                    try:
+                        # محاولة جلب الرسالة من هذا الحساب
+                        messages = await client.get_messages(group_id, ids=message_id)
+                        if messages:
+                            msg = messages
+                            # جلب معلومات القروب
+                            chat = await client.get_entity(group_id)
+                            chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
+                            
+                            # جلب معلومات المرسل
+                            sender_info = ""
+                            try:
+                                sender = await client.get_entity(msg.sender_id)
+                                if sender:
+                                    sname = ""
+                                    if getattr(sender, 'first_name', None):
+                                        sname = sender.first_name
+                                        if getattr(sender, 'last_name', None):
+                                            sname += f" {sender.last_name}"
+                                    if getattr(sender, 'username', None):
+                                        sname += f" (@{sender.username})"
+                                    sender_info = sname if sname else f"مستخدم (`{msg.sender_id}`)"
+                                else:
+                                    sender_info = f"مستخدم (`{msg.sender_id}`)"
+                            except:
+                                sender_info = f"مستخدم (`{msg.sender_id}`)"
+                            
+                            # بناء رسالة العرض
+                            view_text = (
+                                f"📨 **الرسالة الأصلية**\n\n"
+                                f"👥 **القروب:** {chat_title}\n"
+                                f"👤 **المرسل:** {sender_info}\n"
+                                f"📱 **تم جلبها عبر الحساب:** `{phone}`\n"
+                                f"🕐 **التاريخ:** {msg.date.strftime('%Y-%m-%d %H:%M') if msg.date else 'غير معروف'}\n"
+                            )
+                            
+                            if msg.message:
+                                view_text += f"\n📝 **النص:**\n{msg.message}\n"
+                            
+                            if msg.media:
+                                media_type = "📷 صورة" if msg.photo else "📹 فيديو" if msg.video else "🎵 صوت" if msg.audio else "🎤 رسالة صوتية" if msg.voice else "📄 ملف" if msg.document else "📎 مرفق"
+                                view_text += f"\n📂 **يحتوي على:** {media_type}"
+                                
+                                # إرسال الميديا إن وجدت
+                                try:
+                                    # تحميل وإرسال الميديا عبر البوت
+                                    media_path = await client.download_media(msg, file=f"/tmp/media_{message_id}")
+                                    if media_path:
+                                        await bot.send_file(
+                                            user_id,
+                                            media_path,
+                                            caption=view_text
+                                        )
+                                        # حذف الملف المؤقت
+                                        try:
+                                            os.remove(media_path)
+                                        except:
+                                            pass
+                                        found = True
+                                        break
+                                except Exception as e:
+                                    logger.error(f"خطأ في إرسال الميديا: {e}")
+                                    view_text += f"\n⚠️ لم يتم تحميل المرفق: {str(e)[:50]}"
+                            
+                            # إرسال النص فقط (بدون ميديا أو فشل تحميل الميديا)
+                            await bot.send_message(user_id, view_text)
+                            found = True
+                            break
+                    except Exception as e:
+                        logger.info(f"الحساب {phone} لا يستطيع الوصول للرسالة: {e}")
+                        continue
+                
+                if not found:
+                    await event.respond("❌ لم يتم العثور على الرسالة. قد تكون حُذفت أو لا يوجد حساب مراقب يستطيع الوصول إليها.")
         
         # ============ الرد التلقائي ============
         
