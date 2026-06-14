@@ -267,8 +267,9 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر عرض الرسالة - يوديك للرسالة حتى لو لست عضو
-        all_buttons.append([Button.inline("🔗 عرض الرسالة", f"go_msg_{event.chat_id}_{event.id}".encode())])
+        # زر عرض الرسالة - رابط مباشر
+        if link:
+            all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
