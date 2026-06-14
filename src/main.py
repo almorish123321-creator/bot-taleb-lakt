@@ -170,156 +170,196 @@ async def auto_delete_task():
         
         await asyncio.sleep(300)
 
-async def start_monitoring(client, phone):
-    """بدء مراقبة الرسائل للحساب المرتبط - يراقب جميع المجموعات تلقائياً بدون استثناء"""
+# ============ دالة معالجة الرسائل الموحدة ============
+
+async def process_message(event, client, phone):
+    """معالجة الرسالة الواردة من أي حساب مراقب"""
+    global message_map, seen_messages
+    config = load_json_config()
+    keywords = config.get('KEYWORDS', [])
+    ignore_users = config.get('IGNORE_USERS', [])
     
-    async def keep_connection_alive():
-        while True:
-            await asyncio.sleep(300)
+    if not event.is_group:
+        return
+    
+    sender_id = event.sender_id
+    if sender_id in ignore_users:
+        return
+    
+    message_text = event.message.message or ""
+    
+    ignore_reasons = should_ignore_message(message_text, config)
+    
+    if ignore_reasons:
+        logger.info(f"تم تجاهل رسالة من {phone}: {', '.join(ignore_reasons)}")
+        return
+    
+    # ===== كشف التكرار =====
+    if config.get('DUPLICATE_DETECTION', True):
+        msg_key = f"{event.chat_id}_{event.id}_{sender_id}"
+        if msg_key in seen_messages:
+            logger.info(f"تم تجاهل رسالة مكررة من {phone}")
+            return
+        seen_messages.add(msg_key)
+    
+    # التحقق من الكلمات المفتاحية
+    matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
+    if not matched_keywords:
+        return
+    
+    try:
+        chat = await event.get_chat()
+        chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
+        
+        # الحصول على اسم المرسل
+        sender_name = ""
+        try:
+            sender = await event.get_sender()
+            if sender:
+                if getattr(sender, 'first_name', None):
+                    sender_name = sender.first_name
+                    if getattr(sender, 'last_name', None):
+                        sender_name += f" {sender.last_name}"
+                if getattr(sender, 'username', None):
+                    sender_name += f" (@{sender.username})"
+        except:
+            pass
+        
+        link = ""
+        if event.chat:
+            if getattr(event.chat, 'username', None):
+                link = f"https://t.me/{event.chat.username}/{event.id}"
+            else:
+                c_id = str(event.chat_id).replace('-100', '')
+                link = f"https://t.me/c/{c_id}/{event.id}"
+        
+        matched_keyword = matched_keywords[0]
+        
+        # ===== عرض الحساب المراقب الذي جاءت منه الرسالة =====
+        forward_text = (
+            f"📢 **تم العثور على رسالة مطابقة!**\n\n"
+            f"👥 **المجموعة:** {chat_title}\n"
+            f"👤 **المرسل:** {sender_name if sender_name else 'مستخدم'} (`{sender_id}`)\n"
+            f"📱 **الحساب المراقب:** `{phone}`\n"
+            f"🔑 **الكلمة المطابقة:** `{matched_keyword}`\n"
+            f"📝 **الرسالة:**\n{message_text}\n"
+        )
+        
+        # ===== أزرار الرد المنفصلة + زر إضافة رد مباشر =====
+        all_buttons = []
+        
+        # صف أزرار الرد (خاص + قروب)
+        reply_row = []
+        dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+        if dm_templates:
+            reply_row.append(Button.inline("💬 رد خاص", f"dm_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
+        grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+        if grp_templates:
+            reply_row.append(Button.inline("👥 رد قروب", f"grp_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
+        if reply_row:
+            all_buttons.append(reply_row)
+        
+        # صف زر إضافة رد مباشر من القناة
+        add_reply_row = [
+            Button.inline("➕ إضافة رد خاص", f"add_dm_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode()),
+            Button.inline("➕ إضافة رد قروب", f"add_grp_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode())
+        ]
+        all_buttons.append(add_reply_row)
+        
+        # زر عرض الرسالة الأصلية
+        if link:
+            all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
+        
+        sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
+        
+        # حفظ بيانات الرسالة للرد لاحقاً
+        message_map[sent_msg.id] = {
+            "group_id": event.chat_id,
+            "message_id": event.id,
+            "sender_id": sender_id,
+            "phone": phone,
+            "timestamp": time.time()
+        }
+        
+        logger.info(f"تم توجيه رسالة من الحساب {phone} في المجموعة {chat_title}")
+        
+        # ===== الرد التلقائي بالقروب =====
+        auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
+        for kw in matched_keywords:
+            if kw in auto_reply_settings:
+                try:
+                    await client.send_message(
+                        event.chat_id,
+                        auto_reply_settings[kw],
+                        reply_to=event.id
+                    )
+                    logger.info(f"تم إرسال رد تلقائي للكلمة '{kw}' في القروب")
+                except Exception as e:
+                    logger.error(f"خطأ في إرسال الرد التلقائي: {e}")
+                break
+        
+    except Exception as e:
+        logger.error(f"خطأ في توجيه الرسالة من {phone}: {e}")
+
+# ============ تسجيل معالج الرسائل وتشغيل المراقبة ============
+
+def register_handler(client, phone):
+    """تسجيل معالج الرسائل لحساب معين - يتم استدعاؤه مرة واحدة لكل حساب"""
+    @client.on(events.NewMessage())
+    async def message_handler(event):
+        await process_message(event, client, phone)
+    
+    logger.info(f"✅ تم تسجيل معالج الرسائل للحساب {phone}")
+    return message_handler
+
+async def start_monitoring(client, phone):
+    """بدء مراقبة الاتصال للحساب - مع إعادة الاتصال التلقائي
+    
+    ملاحظة: يجب استدعاء register_handler(client, phone) قبل هذه الدالة
+    """
+    
+    logger.info(f"🔄 بدء حلقة المراقبة للحساب {phone}")
+    
+    # حلقة مراقبة مع إعادة اتصال تلقائية
+    while True:
+        try:
+            # التأكد من أن العميل متصل
+            if not client.is_connected():
+                logger.warning(f"⚠️ الحساب {phone} غير متصل، جاري إعادة الاتصال...")
+                try:
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        logger.info(f"✅ تم إعادة اتصال الحساب {phone} بنجاح")
+                    else:
+                        logger.error(f"❌ الحساب {phone} غير مصرح، لا يمكن إعادة الاتصال")
+                        break
+                except Exception as e:
+                    logger.error(f"❌ فشل إعادة اتصال الحساب {phone}: {e}")
+                    await asyncio.sleep(15)
+                    continue
+            
+            # إرسال إشارة بقاء
             try:
                 await client.get_me()
-                logger.info(f"✅ تم إرسال إشارة البقاء على قيد الحياة للحساب {phone}")
+                logger.info(f"✅ الحساب {phone} متصل ويعمل")
             except Exception as e:
-                logger.error(f"⚠️ فشل إرسال إشارة البقاء: {e}")
-                try:
-                    await client.disconnect()
-                    await client.connect()
-                    logger.info(f"🔄 تمت إعادة الاتصال للحساب {phone}")
-                except Exception as reconnect_error:
-                    logger.error(f"❌ فشلت إعادة الاتصال: {reconnect_error}")
-    
-    asyncio.create_task(keep_connection_alive())
-    
-    @client.on(events.NewMessage())
-    async def handler(event):
-        global message_map, seen_messages
-        config = load_json_config()
-        keywords = config.get('KEYWORDS', [])
-        ignore_users = config.get('IGNORE_USERS', [])
-        
-        if event.is_group:
-            sender_id = event.sender_id
-            if sender_id in ignore_users:
-                return
+                logger.error(f"⚠️ فشل فحص اتصال الحساب {phone}: {e}")
+                await asyncio.sleep(10)
+                continue
             
-            message_text = event.message.message or ""
+            # انتظار انقطاع الاتصال
+            try:
+                await client.disconnected
+            except Exception as e:
+                logger.error(f"خطأ في انتظار اتصال الحساب {phone}: {e}")
             
-            ignore_reasons = should_ignore_message(message_text, config)
+            # إذا وصلنا هنا يعني أن الاتصال انقطع
+            logger.warning(f"⚠️ انقطع اتصال الحساب {phone}، جاري إعادة الاتصال...")
+            await asyncio.sleep(5)
             
-            if ignore_reasons:
-                logger.info(f"تم تجاهل رسالة من {phone}: {', '.join(ignore_reasons)}")
-                return
-            
-            # ===== كشف التكرار =====
-            if config.get('DUPLICATE_DETECTION', True):
-                msg_key = f"{event.chat_id}_{event.id}_{sender_id}"
-                if msg_key in seen_messages:
-                    logger.info(f"تم تجاهل رسالة مكررة من {phone}")
-                    return
-                seen_messages.add(msg_key)
-            
-            # التحقق من الكلمات المفتاحية
-            matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
-            if matched_keywords:
-                try:
-                    chat = await event.get_chat()
-                    chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
-                    
-                    # الحصول على اسم المرسل
-                    sender_name = ""
-                    try:
-                        sender = await event.get_sender()
-                        if sender:
-                            if getattr(sender, 'first_name', None):
-                                sender_name = sender.first_name
-                                if getattr(sender, 'last_name', None):
-                                    sender_name += f" {sender.last_name}"
-                            if getattr(sender, 'username', None):
-                                sender_name += f" (@{sender.username})"
-                    except:
-                        pass
-                    
-                    link = ""
-                    if event.chat:
-                        if getattr(event.chat, 'username', None):
-                            link = f"https://t.me/{event.chat.username}/{event.id}"
-                        else:
-                            c_id = str(event.chat_id).replace('-100', '')
-                            link = f"https://t.me/c/{c_id}/{event.id}"
-                    
-                    matched_keyword = matched_keywords[0]
-                    
-                    # ===== عرض الحساب المراقب الذي جاءت منه الرسالة =====
-                    forward_text = (
-                        f"📢 **تم العثور على رسالة مطابقة!**\n\n"
-                        f"👥 **المجموعة:** {chat_title}\n"
-                        f"👤 **المرسل:** {sender_name if sender_name else 'مستخدم'} (`{sender_id}`)\n"
-                        f"📱 **الحساب المراقب:** `{phone}`\n"
-                        f"🔑 **الكلمة المطابقة:** `{matched_keyword}`\n"
-                        f"📝 **الرسالة:**\n{message_text}\n"
-                    )
-                    
-                    # ===== أزرار الرد المنفصلة + زر إضافة رد مباشر =====
-                    all_buttons = []
-                    
-                    # صف أزرار الرد (خاص + قروب)
-                    reply_row = []
-                    dm_templates = config.get('DM_REPLY_TEMPLATES', [])
-                    if dm_templates:
-                        reply_row.append(Button.inline("💬 رد خاص", f"dm_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
-                    grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
-                    if grp_templates:
-                        reply_row.append(Button.inline("👥 رد قروب", f"grp_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
-                    if reply_row:
-                        all_buttons.append(reply_row)
-                    
-                    # صف زر إضافة رد مباشر من القناة
-                    add_reply_row = [
-                        Button.inline("➕ إضافة رد خاص", f"add_dm_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode()),
-                        Button.inline("➕ إضافة رد قروب", f"add_grp_from_ch_{event.chat_id}_{event.id}_{sender_id}".encode())
-                    ]
-                    all_buttons.append(add_reply_row)
-                    
-                    # زر عرض الرسالة الأصلية
-                    if link:
-                        all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
-                    
-                    sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
-                    
-                    # حفظ بيانات الرسالة للرد لاحقاً
-                    message_map[sent_msg.id] = {
-                        "group_id": event.chat_id,
-                        "message_id": event.id,
-                        "sender_id": sender_id,
-                        "phone": phone,
-                        "timestamp": time.time()
-                    }
-                    
-                    logger.info(f"تم توجيه رسالة من الحساب {phone}")
-                    
-                    # ===== الرد التلقائي بالقروب =====
-                    auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
-                    for kw in matched_keywords:
-                        if kw in auto_reply_settings:
-                            try:
-                                await client.send_message(
-                                    event.chat_id,
-                                    auto_reply_settings[kw],
-                                    reply_to=event.id
-                                )
-                                logger.info(f"تم إرسال رد تلقائي للكلمة '{kw}' في القروب")
-                            except Exception as e:
-                                logger.error(f"خطأ في إرسال الرد التلقائي: {e}")
-                            break
-                    
-                except Exception as e:
-                    logger.error(f"خطأ في توجيه الرسالة: {e}")
-
-    logger.info(f"بدأت المراقبة للحساب {phone} - سيتم مراقبة جميع المجموعات تلقائياً")
-    try:
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"انقطع اتصال الحساب {phone}: {e}")
+        except Exception as e:
+            logger.error(f"❌ خطأ غير متوقع في مراقبة الحساب {phone}: {e}")
+            await asyncio.sleep(10)
 
 async def setup_bot_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
@@ -939,6 +979,8 @@ async def setup_bot_handlers():
                 await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
                 
                 active_clients[state['phone']] = client
+                # تسجيل المعالج أولاً ثم بدء المراقبة
+                register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
@@ -955,6 +997,8 @@ async def setup_bot_handlers():
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
                 active_clients[state['phone']] = client
+                # تسجيل المعالج أولاً ثم بدء المراقبة
+                register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except Exception as e:
@@ -1161,16 +1205,20 @@ async def main():
     asyncio.create_task(auto_delete_task())
     
     # استئناف الجلسات الموجودة
-    for f in os.listdir('.'):
+    session_dir = os.path.dirname(os.path.abspath(__file__))
+    for f in os.listdir(session_dir):
         if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
             phone = f.replace('session_', '').replace('.session', '')
             try:
-                client = TelegramClient(f.replace('.session', ''), API_ID, API_HASH)
+                session_path = os.path.join(session_dir, f.replace('.session', ''))
+                client = TelegramClient(session_path, API_ID, API_HASH)
                 await client.connect()
                 if await client.is_user_authorized():
                     active_clients[phone] = client
+                    # تسجيل المعالج وبدء المراقبة
+                    register_handler(client, phone)
                     asyncio.create_task(start_monitoring(client, phone))
-                    logger.info(f"تم استئناف الحساب {phone} والمراقبة تشمل جميع المجموعات")
+                    logger.info(f"✅ تم استئناف الحساب {phone} وتسجيل المعالج - يراقب جميع المجموعات")
                 else:
                     logger.warning(f"الجلسة {phone} غير مصرحة.")
             except Exception as e:
