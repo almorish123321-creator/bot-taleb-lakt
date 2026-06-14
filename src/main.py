@@ -192,7 +192,7 @@ async def process_message(event, client, phone):
     ignore_reasons = should_ignore_message(message_text, config)
     
     if ignore_reasons:
-        logger.info(f"تم تجاهل رسالة من {phone}: {', '.join(ignore_reasons)}")
+        logger.warning(f"⛔ تم تجاهل رسالة من {phone} في القروب {event.chat_id}: {', '.join(ignore_reasons)} | نص الرسالة: {message_text[:80]}")
         return
     
     # ===== كشف التكرار =====
@@ -546,13 +546,26 @@ async def setup_bot_handlers():
                 [Button.inline('👤 تبديل منع المعرفات', b'toggle_mentions')],
                 [Button.inline('📢 تبديل منع الإعلانات', b'toggle_ads')],
                 [Button.inline('⚠️ تبديل منع المشبوهة', b'toggle_suspicious')],
+                [Button.inline('🔓 تعطيل جميع الفلاتر (مستحسن)', b'reset_filters')],
                 [Button.inline('🔙 رجوع', b'back_main')]
             ]
             await event.respond(msg, buttons=buttons)
         
         elif data == b'set_max_length':
             login_states[user_id] = {'step': 'set_max_length'}
-            await event.respond("📏 أرسل الحد الأقصى الجديد لعدد الأحرف (رقم بين 10 و 500):")
+            await event.respond("📏 أرسل الحد الأقصى الجديد لعدد الأحرف (0 = بدون حد، أو رقم بين 10 و 500):")
+        
+        elif data == b'reset_filters':
+            config['FILTERS'] = {
+                'max_length': 0,
+                'block_links': False,
+                'block_phones': False,
+                'block_mentions': False,
+                'block_ads': False,
+                'block_suspicious': False
+            }
+            update_json_config(config)
+            await event.respond("✅ تم تعطيل جميع الفلاتر! الآن سيتم توجيه جميع الرسائل المطابقة للكلمات المفتاحية بلا حجب.\n\n💡 يمكنك تفعيل أي فلتر يدوياً من إعدادات الفلترة.")
         
         elif data == b'toggle_links':
             filters = config.get('FILTERS', {})
@@ -1175,14 +1188,17 @@ async def setup_bot_handlers():
         elif state['step'] == 'set_max_length':
             try:
                 new_max = int(text)
-                if 10 <= new_max <= 500:
+                if new_max == 0 or (10 <= new_max <= 500):
                     filters = config.get('FILTERS', {})
                     filters['max_length'] = new_max
                     config['FILTERS'] = filters
                     update_json_config(config)
-                    await event.respond(f"✅ تم تغيير الحد الأقصى للأحرف إلى `{new_max}`")
+                    if new_max == 0:
+                        await event.respond("✅ تم تعطيل حد الأحرف - الآن جميع الرسائل بلا قيد الطول ستُمرر")
+                    else:
+                        await event.respond(f"✅ تم تغيير الحد الأقصى للأحرف إلى `{new_max}`")
                 else:
-                    await event.respond("❌ الرقم يجب أن يكون بين 10 و 500")
+                    await event.respond("❌ الرقم يجب أن يكون 0 (بدون حد) أو بين 10 و 500")
             except ValueError:
                 await event.respond("❌ من فضلك أرسل رقماً صحيحاً")
             del login_states[user_id]
@@ -1280,8 +1296,43 @@ async def main():
     global bot
     keep_alive()
     logger.info("جاري تشغيل البوت...")
+    
+    # التحقق من المتغيرات المطلوبة
+    if not BOT_TOKEN:
+        logger.critical("❌ BOT_TOKEN غير محدد! تأكد من تعيينه في متغيرات البيئة.")
+        return
+    if not CHANNEL_ID:
+        logger.critical("❌ CHANNEL_ID غير محدد! تأكد من تعيينه في متغيرات البيئة.")
+        return
+    if not API_ID or not API_HASH:
+        logger.critical("❌ API_ID أو API_HASH غير محدد! تأكد من تعيينهما في متغيرات البيئة.")
+        return
+    
+    logger.info(f"✅ CHANNEL_ID = {CHANNEL_ID}")
+    logger.info(f"✅ API_ID = {API_ID}")
+    
     bot = TelegramClient('bot_session', API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
+    logger.info("✅ تم تشغيل البوت بنجاح")
+    
+    # التحقق من الوصول للقناة
+    try:
+        channel_entity = await bot.get_entity(CHANNEL_ID)
+        logger.info(f"✅ تم الوصول للقناة: {getattr(channel_entity, 'title', CHANNEL_ID)}")
+    except Exception as e:
+        logger.critical(f"❌ لا يمكن الوصول للقناة {CHANNEL_ID}: {e}")
+        logger.critical("❌ تأكد أن البوت مشرف في القناة وأن CHANNEL_ID صحيح!")
+        return
+    
+    # التحقق من إعدادات الفلترة وتحذير المستخدم
+    config = load_json_config()
+    filters = config.get('FILTERS', {})
+    max_len = filters.get('max_length', 50)
+    if max_len > 0 and max_len < 200:
+        logger.warning(f"⚠️ الحد الأقصى للأحرف ({max_len}) صغير جداً! قد يمنع توجيه أغلب الرسائل. يُنصح بتعيينه 0 (بدون حد)")
+    if filters.get('block_links', True):
+        logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
+    
     await setup_bot_handlers()
     
     # بدء مهمة الحذف التلقائي
@@ -1289,9 +1340,14 @@ async def main():
     
     # استئناف الجلسات الموجودة
     session_dir = os.path.dirname(os.path.abspath(__file__))
+    resumed_count = 0
     for f in os.listdir(session_dir):
         if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
             phone = f.replace('session_', '').replace('.session', '')
+            # تجاهل الجلسات القديمة غير الصالحة
+            if phone in ['bot', 'bot2', 'main', 'krtkmahan']:
+                logger.warning(f"⚠️ تجاهل جلسة قديمة غير صالحة: {phone}")
+                continue
             try:
                 session_path = os.path.join(session_dir, f.replace('.session', ''))
                 client = TelegramClient(session_path, API_ID, API_HASH)
@@ -1301,13 +1357,14 @@ async def main():
                     # تسجيل المعالج وبدء المراقبة
                     register_handler(client, phone)
                     asyncio.create_task(start_monitoring(client, phone))
+                    resumed_count += 1
                     logger.info(f"✅ تم استئناف الحساب {phone} وتسجيل المعالج - يراقب جميع المجموعات")
                 else:
                     logger.warning(f"الجلسة {phone} غير مصرحة.")
             except Exception as e:
                 logger.error(f"فشل استئناف الحساب {phone}: {e}")
 
-    logger.info("البوت يعمل الآن بكامل طاقته - يراقب جميع المجموعات تلقائياً")
+    logger.info(f"✅ البوت يعمل الآن - يراقب {resumed_count} حساب/حسابات - يراقب جميع المجموعات تلقائياً")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':

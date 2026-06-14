@@ -32,12 +32,12 @@ def load_json_config():
         "BANNED_ADS": ["عرض", "خصم", "تخفيض", "سعر", "شراء", "بيع", "كوبون", "تسويق", "إعلان"],
         "SUSPICIOUS_WORDS": ["احتيال", "نصبة", "فيروس", "اختراق", "تزوير", "فدية", "سرقة"],
         "FILTERS": {
-            "max_length": 50,
-            "block_links": True,
-            "block_phones": True,
-            "block_mentions": True,
-            "block_ads": True,
-            "block_suspicious": True
+            "max_length": 0,
+            "block_links": False,
+            "block_phones": False,
+            "block_mentions": False,
+            "block_ads": False,
+            "block_suspicious": False
         }
     }
     
