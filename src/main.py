@@ -21,7 +21,19 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "البوت يعمل بنجاح!"
+    return "البوت يعمل بنجاح!", 200
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+@app.route('/status')
+def status():
+    return {
+        "bot_started": bot is not None,
+        "active_clients": list(active_clients.keys()),
+        "message_map_size": len(message_map)
+    }, 200
 
 def run():
     port = int(os.environ.get('PORT', 8080))
@@ -1296,26 +1308,57 @@ async def setup_bot_handlers():
 
 async def main():
     global bot
+    # تشغيل Flask أولاً - يجب أن يعمل حتى لو فشل Telegram
     keep_alive()
-    logger.info("جاري تشغيل البوت...")
+    logger.info("=" * 60)
+    logger.info("🚀 بدء تشغيل البوت...")
+    logger.info("=" * 60)
     
     # التحقق من المتغيرات المطلوبة
     if not BOT_TOKEN:
         logger.critical("❌ BOT_TOKEN غير محدد! تأكد من تعيينه في متغيرات البيئة.")
+        # لا نخرج - نبقي Flask شغال
+        while True:
+            await asyncio.sleep(3600)
         return
     if not CHANNEL_ID:
         logger.critical("❌ CHANNEL_ID غير محدد! تأكد من تعيينه في متغيرات البيئة.")
+        while True:
+            await asyncio.sleep(3600)
         return
     if not API_ID or not API_HASH:
         logger.critical("❌ API_ID أو API_HASH غير محدد! تأكد من تعيينهما في متغيرات البيئة.")
+        while True:
+            await asyncio.sleep(3600)
         return
     
+    logger.info(f"✅ BOT_TOKEN محدد ({len(BOT_TOKEN)} حرف)")
     logger.info(f"✅ CHANNEL_ID = {CHANNEL_ID}")
     logger.info(f"✅ API_ID = {API_ID}")
+    logger.info(f"✅ API_HASH محدد ({len(API_HASH)} حرف)")
     
-    bot = TelegramClient('bot_session', API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
-    logger.info("✅ تم تشغيل البوت بنجاح")
+    # محاولة تشغيل البوت مع إعادة المحاولة
+    max_retries = 5
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            logger.info(f"🔄 محاولة تشغيل البوت ({retry_count + 1}/{max_retries})...")
+            session_dir = os.path.dirname(os.path.abspath(__file__))
+            session_path = os.path.join(session_dir, 'bot_session')
+            bot = TelegramClient(session_path, API_ID, API_HASH)
+            await bot.start(bot_token=BOT_TOKEN)
+            logger.info("✅ تم تشغيل البوت بنجاح!")
+            break
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"❌ فشل تشغيل البوت (محاولة {retry_count}/{max_retries}): {type(e).__name__}: {e}")
+            if retry_count >= max_retries:
+                logger.critical("❌ فشل تشغيل البوت بعد عدة محاولات. البوت سيبقى نائماً لكن Flask شغال.")
+                # نبقي العملية حية عشان Flask يشتغل
+                while True:
+                    await asyncio.sleep(3600)
+                return
+            await asyncio.sleep(10)
     
     # التحقق من الوصول للقناة
     try:
@@ -1324,24 +1367,25 @@ async def main():
     except Exception as e:
         logger.critical(f"❌ لا يمكن الوصول للقناة {CHANNEL_ID}: {e}")
         logger.critical("❌ تأكد أن البوت مشرف في القناة وأن CHANNEL_ID صحيح!")
-        return
+        # نكمل عشان البوت نفسه يرد على /start
     
     # التحقق من إعدادات الفلترة وتحذير المستخدم
     config = load_json_config()
     filters = config.get('FILTERS', {})
-    max_len = filters.get('max_length', 50)
+    max_len = filters.get('max_length', 0)
     if max_len > 0 and max_len < 200:
         logger.warning(f"⚠️ الحد الأقصى للأحرف ({max_len}) صغير جداً! قد يمنع توجيه أغلب الرسائل. يُنصح بتعيينه 0 (بدون حد)")
-    if filters.get('block_links', True):
+    if filters.get('block_links', False):
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
+    logger.info(f"📋 الكلمات المفتاحية: {config.get('KEYWORDS', [])}")
     
     await setup_bot_handlers()
+    logger.info("✅ تم تسجيل معالجات البوت")
     
     # بدء مهمة الحذف التلقائي
     asyncio.create_task(auto_delete_task())
     
     # استئناف الجلسات الموجودة
-    session_dir = os.path.dirname(os.path.abspath(__file__))
     resumed_count = 0
     for f in os.listdir(session_dir):
         if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
@@ -1367,6 +1411,7 @@ async def main():
                 logger.error(f"فشل استئناف الحساب {phone}: {e}")
 
     logger.info(f"✅ البوت يعمل الآن - يراقب {resumed_count} حساب/حسابات - يراقب جميع المجموعات تلقائياً")
+    logger.info("=" * 60)
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
