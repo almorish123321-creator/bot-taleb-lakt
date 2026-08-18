@@ -192,14 +192,23 @@ async def process_message(event, client, phone):
     keywords = config.get('KEYWORDS', [])
     ignore_users = config.get('IGNORE_USERS', [])
     
-    if not event.is_group:
+    # تجاهل الرسائل الخاصة (DM) - نراقب فقط القروبات والقنوات
+    if event.is_private:
         return
     
     sender_id = event.sender_id
     if sender_id in ignore_users:
         return
     
-    message_text = event.message.message or ""
+    # دعم الرسائل النصية + الكابشن (للصور والملفات)
+    message_text = ""
+    if event.message and event.message.message:
+        message_text = event.message.message
+    elif event.message and hasattr(event.message, 'caption') and event.message.caption:
+        message_text = event.message.caption
+    
+    if not message_text:
+        return  # ما فيه نص نراقبه
     
     ignore_reasons = should_ignore_message(message_text, config)
     
@@ -279,9 +288,8 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر عرض الرسالة - رابط مباشر فقط (بدون رابط دعوة)
-        if link:
-            all_buttons.append([Button.url("🔗 عرض الرسالة", url=link)])
+        # زر عرض الرسالة - يحاول يدخلك للقروب حتى لو مو مشترك
+        all_buttons.append([Button.inline("🔗 عرض الرسالة", f"go_msg_{event.chat_id}_{event.id}".encode())])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         
@@ -839,14 +847,12 @@ async def setup_bot_handlers():
                 group_id = int(parts[2])
                 message_id = int(parts[3])
                 
+                await event.answer("🔄 جاري البحث عن طريقة للوصول للرسالة...", alert=False)
+                
                 chat_title = "غير معروف"
                 chat_username = None
                 invite_link = None
                 msg_link = None
-                
-                # بناء رابط الرسالة الأساسي
-                c_id = str(group_id).replace('-100', '')
-                msg_link = f"https://t.me/c/{c_id}/{message_id}"
                 
                 # محاولة من كل الحسابات المراقبة
                 for phone, client in active_clients.items():
@@ -858,19 +864,25 @@ async def setup_bot_handlers():
                         # إذا القروب عام - رابط مباشر يكفي
                         if chat_username:
                             msg_link = f"https://t.me/{chat_username}/{message_id}"
+                            logger.info(f"✅ القروب عام - رابط مباشر من الحساب {phone}")
                             # القروب عام = أي شخص يقدر يفتحه
-                            await event.respond(
+                            await event.edit(
                                 f"📨 **{chat_title}**\n🔗 اضغط لفتح الرسالة مباشرة:",
                                 buttons=[[Button.url("🔗 افتح الرسالة", url=msg_link)]]
                             )
                             return
                         
+                        # بناء رابط الرسالة للقروب الخاص
+                        c_id = str(group_id).replace('-100', '')
+                        msg_link = f"https://t.me/c/{c_id}/{message_id}"
+                        
                         # إذا القروب خاص - نحتاج رابط دعوة
                         try:
                             result = await client(ExportChatInviteRequest(group_id))
                             invite_link = result.link
+                            logger.info(f"✅ تم إنشاء رابط دعوة من الحساب {phone}")
                             break
-                        except Exception:
+                        except Exception as e1:
                             # البحث عن رابط دعوة موجود
                             try:
                                 from telethon.tl.functions.messages import GetExportedChatInvitesRequest
@@ -878,25 +890,27 @@ async def setup_bot_handlers():
                                 invites = await client(GetExportedChatInvitesRequest(
                                     peer=group_id,
                                     admin_id=me,
-                                    limit=5
+                                    limit=10
                                 ))
                                 for inv in invites.invites:
                                     if not getattr(inv, 'revoked', False):
                                         invite_link = inv.link
+                                        logger.info(f"✅ تم العثور على رابط دعوة موجود من الحساب {phone}")
                                         break
                                 if invite_link:
                                     break
-                            except Exception:
-                                pass
+                            except Exception as e2:
+                                logger.info(f"الحساب {phone} ما يقدر ينشئ رابط دعوة: {e1} | {e2}")
+                                # نجرب الحساب التالي
                         
                     except Exception as e:
                         logger.info(f"الحساب {phone} لا يستطيع الوصول لـ {group_id}: {e}")
                         continue
                 
-                # بناء الرد
-                if invite_link:
+                # بناء الرد النهائي
+                if invite_link and msg_link:
                     # قروب خاص - نعطي رابط دعوة + رابط الرسالة
-                    await event.respond(
+                    await event.edit(
                         f"📨 **{chat_title}** (قروب خاص)\n\n"
                         f"1️⃣ انضم أولاً:\n"
                         f"2️⃣ ثم افتح الرسالة:",
@@ -907,7 +921,7 @@ async def setup_bot_handlers():
                     )
                 elif msg_link:
                     # ما قدرنا نجيب رابط دعوة بس رابط الرسالة موجود
-                    await event.respond(
+                    await event.edit(
                         f"📨 **{chat_title}**\n🔗 افتح الرسالة:",
                         buttons=[[Button.url("🔗 افتح الرسالة", url=msg_link)]]
                     )
