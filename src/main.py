@@ -1337,9 +1337,10 @@ async def main():
     logger.info(f"✅ API_ID = {API_ID}")
     logger.info(f"✅ API_HASH محدد ({len(API_HASH)} حرف)")
     
-    # محاولة تشغيل البوت مع إعادة المحاولة
-    max_retries = 5
+    # محاولة تشغيل البوت مع إعادة المحاولة (exponential backoff)
+    max_retries = 10
     retry_count = 0
+    backoff = 30  # ابدأ بـ 30 ثانية
     while retry_count < max_retries:
         try:
             logger.info(f"🔄 محاولة تشغيل البوت ({retry_count + 1}/{max_retries})...")
@@ -1351,14 +1352,24 @@ async def main():
             break
         except Exception as e:
             retry_count += 1
+            err_str = str(e).lower()
             logger.error(f"❌ فشل تشغيل البوت (محاولة {retry_count}/{max_retries}): {type(e).__name__}: {e}")
+            
+            # كشف 429 Too Many Requests - نطول الانتظار
+            if '429' in err_str or 'too many requests' in err_str or 'flood' in err_str:
+                logger.warning(f"⏳ تيليجرام حظر البوت مؤقتاً (429). سأنتظر {backoff * 6} ثانية قبل المحاولة...")
+                await asyncio.sleep(backoff * 6)  # 3 دقائق على الأقل
+                backoff = min(backoff * 2, 600)  # ضعف الانتظار، حد أقصى 10 دقائق
+            else:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)  # ضعف الانتظار، حد أقصى 5 دقائق
+            
             if retry_count >= max_retries:
                 logger.critical("❌ فشل تشغيل البوت بعد عدة محاولات. البوت سيبقى نائماً لكن Flask شغال.")
                 # نبقي العملية حية عشان Flask يشتغل
                 while True:
                     await asyncio.sleep(3600)
                 return
-            await asyncio.sleep(10)
     
     # التحقق من الوصول للقناة
     try:
