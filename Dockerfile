@@ -12,9 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY ./src ./src
 COPY ./config.json ./src/config.json
 
-# Copy the .env file (this will be generated during the installation)
-COPY .env .env
-
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 

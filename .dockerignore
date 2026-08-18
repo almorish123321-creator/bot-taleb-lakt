@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.session
+.env
+.git
+.gitignore
+README.md
+LICENSE
+Makefile
+Makefile.md
+install.sh
+HOSTING_GUIDE.md
+INTERACTIVE_GUIDE.md
+bot_report.md
+pyproject.toml
+docker-compose.yml
