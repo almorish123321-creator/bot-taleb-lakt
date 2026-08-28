@@ -51,6 +51,32 @@ def debug():
         "active_clients_count": len(active_clients),
     }, 200
 
+@app.route('/stats')
+def stats_endpoint():
+    """إحصائيات حية لتتبع عمل البوت"""
+    config = load_json_config()
+    return {
+        "bot_started": bot is not None,
+        "active_clients": list(active_clients.keys()),
+        "active_clients_count": len(active_clients),
+        "keywords_loaded": config.get('KEYWORDS', []),
+        "keywords_count": len(config.get('KEYWORDS', [])),
+        "filters": config.get('FILTERS', {}),
+        "stats": stats,
+        "message_map_size": len(message_map),
+        "seen_messages_size": len(seen_messages),
+    }, 200
+
+@app.route('/test_forward')
+def test_forward():
+    """اختبار إرسال رسالة للقناة - للتأكد من أن CHANNEL_ID صحيح والبوت مشرف"""
+    return {
+        "message": "هذا endpoint تشخيصي فقط. استخدم البوت لاختبار التحويل فعلياً.",
+        "channel_id": os.environ.get('CHANNEL_ID'),
+        "active_clients_count": len(active_clients),
+        "bot_started": bot is not None,
+    }, 200
+
 def run():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
@@ -70,6 +96,19 @@ login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': 
 message_map = {}
 # seen_messages: مجموعة لتتبع الرسائل المعالجة (كشف التكرار)
 seen_messages = set()
+# عدادات للتشخيص
+stats = {
+    'messages_received': 0,    # كل الرسائل الواردة من الحسابات المراقبة
+    'messages_ignored_filter': 0,  # رُفضت بسبب الفلاتر
+    'messages_matched': 0,     # طابقت كلمات مفتاحية
+    'messages_forwarded': 0,   # حُوّلت للقناة بنجاح
+    'messages_failed': 0,      # فشل تحويلها
+    'last_received_at': None,
+    'last_matched_at': None,
+    'last_forwarded_at': None,
+    'last_message_preview': None,
+    'last_ignored_reason': None,
+}
 
 # ============ دوال الفلترة المتقدمة ============
 
@@ -120,36 +159,37 @@ def should_ignore_message(message_text, config):
     """تطبيق جميع شروط التجاهل"""
     ignore_reasons = []
     
+    # افتراضيات متساهلة (السماح بكل شيء) — تُستخدم فقط لو ما فيه FILTERS في config
     filters = config.get('FILTERS', {
-        'max_length': 50,
-        'block_links': True,
-        'block_phones': True,
-        'block_mentions': True,
-        'block_ads': True,
-        'block_suspicious': True
+        'max_length': 0,
+        'block_links': False,
+        'block_phones': False,
+        'block_mentions': False,
+        'block_ads': False,
+        'block_suspicious': False
     })
     
     banned_ads = config.get('BANNED_ADS', [])
     suspicious_words = config.get('SUSPICIOUS_WORDS', [])
     
-    if filters.get('max_length', 50) > 0:
-        max_len = filters.get('max_length', 50)
+    if filters.get('max_length', 0) > 0:
+        max_len = filters.get('max_length', 0)
         if is_too_long(message_text, max_len):
             ignore_reasons.append(f"تجاوز {max_len} حرفاً ({len(message_text.strip())} حرف)")
     
-    if filters.get('block_links', True) and contains_link(message_text):
+    if filters.get('block_links', False) and contains_link(message_text):
         ignore_reasons.append("يحتوي على رابط")
     
-    if filters.get('block_phones', True) and contains_phone(message_text):
+    if filters.get('block_phones', False) and contains_phone(message_text):
         ignore_reasons.append("يحتوي على رقم هاتف")
     
-    if filters.get('block_mentions', True) and contains_mention(message_text):
+    if filters.get('block_mentions', False) and contains_mention(message_text):
         ignore_reasons.append("يحتوي على معرف @")
     
-    if filters.get('block_ads', True) and banned_ads and is_announcement(message_text, banned_ads):
+    if filters.get('block_ads', False) and banned_ads and is_announcement(message_text, banned_ads):
         ignore_reasons.append("رسالة إعلانية (كلمة محظورة)")
     
-    if filters.get('block_suspicious', True) and suspicious_words and contains_suspicious_words(message_text, suspicious_words):
+    if filters.get('block_suspicious', False) and suspicious_words and contains_suspicious_words(message_text, suspicious_words):
         ignore_reasons.append("يحتوي على كلمات مشبوهة")
     
     return ignore_reasons
@@ -203,7 +243,7 @@ async def auto_delete_task():
 
 async def process_message(event, client, phone):
     """معالجة الرسالة الواردة من أي حساب مراقب"""
-    global message_map, seen_messages
+    global message_map, seen_messages, stats
     config = load_json_config()
     keywords = config.get('KEYWORDS', [])
     ignore_users = config.get('IGNORE_USERS', [])
@@ -226,9 +266,16 @@ async def process_message(event, client, phone):
     if not message_text:
         return  # ما فيه نص نراقبه
     
+    # ===== عداد: رسالة واردة =====
+    stats['messages_received'] += 1
+    stats['last_received_at'] = time.time()
+    stats['last_message_preview'] = message_text[:80]
+    
     ignore_reasons = should_ignore_message(message_text, config)
     
     if ignore_reasons:
+        stats['messages_ignored_filter'] += 1
+        stats['last_ignored_reason'] = ', '.join(ignore_reasons)
         logger.warning(f"⛔ تم تجاهل رسالة من {phone} في القروب {event.chat_id}: {', '.join(ignore_reasons)} | نص الرسالة: {message_text[:80]}")
         return
     
@@ -243,7 +290,11 @@ async def process_message(event, client, phone):
     # التحقق من الكلمات المفتاحية
     matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
     if not matched_keywords:
-        return
+        return  # ما فيها كلمة مفتاحية
+    
+    stats['messages_matched'] += 1
+    stats['last_matched_at'] = time.time()
+    logger.info(f"🎯 مطابقة! من {phone} | كلمات: {matched_keywords} | نص: {message_text[:60]}")
     
     try:
         chat = await event.get_chat()
@@ -318,7 +369,9 @@ async def process_message(event, client, phone):
             "timestamp": time.time()
         }
         
-        logger.info(f"تم توجيه رسالة من الحساب {phone} في المجموعة {chat_title}")
+        stats['messages_forwarded'] += 1
+        stats['last_forwarded_at'] = time.time()
+        logger.info(f"✅ تم توجيه رسالة من الحساب {phone} في المجموعة {chat_title} → القناة")
         
         # ===== الرد التلقائي بالقروب =====
         auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
@@ -336,6 +389,7 @@ async def process_message(event, client, phone):
                 break
         
     except Exception as e:
+        stats['messages_failed'] += 1
         logger.error(f"خطأ في توجيه الرسالة من {phone}: {e}")
 
 # ============ تسجيل معالج الرسائل وتشغيل المراقبة ============
