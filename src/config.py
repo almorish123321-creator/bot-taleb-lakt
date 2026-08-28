@@ -19,9 +19,10 @@ if CHANNEL_ID:
 SESSION_NAME = os.getenv('SESSION_NAME', 'telegram_monitor_session')
 
 # ============ إعدادات ملف JSON ============
-# استخدام نفس المجلد الذي يوجد فيه config.py لتخزين config_data.json
+# استخدام نفس المجلد الذي يوجد فيه config.py لتخزين config.json
+# (نستخدم config.json مباشرة لأنه موجود في المستودع ويتم نسخه في Dockerfile)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, 'config_data.json')
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 
 def load_json_config():
     """تحميل جميع الإعدادات من ملف JSON مع القيم الافتراضية"""
