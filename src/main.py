@@ -35,6 +35,22 @@ def status():
         "message_map_size": len(message_map)
     }, 200
 
+@app.route('/debug')
+def debug():
+    """endpoint تشخيصي - يعرض حالة المتغيرات البيئية (بدون كشف القيم)"""
+    return {
+        "BOT_TOKEN_set": bool(os.environ.get('BOT_TOKEN')),
+        "BOT_TOKEN_len": len(os.environ.get('BOT_TOKEN', '')),
+        "API_ID_set": bool(os.environ.get('API_ID')),
+        "API_ID_value": os.environ.get('API_ID'),
+        "API_HASH_set": bool(os.environ.get('API_HASH')),
+        "API_HASH_len": len(os.environ.get('API_HASH', '')),
+        "CHANNEL_ID_set": bool(os.environ.get('CHANNEL_ID')),
+        "CHANNEL_ID_value": os.environ.get('CHANNEL_ID'),
+        "bot_started": bot is not None,
+        "active_clients_count": len(active_clients),
+    }, 200
+
 def run():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
