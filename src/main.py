@@ -62,6 +62,7 @@ def stats_endpoint():
         "keywords_loaded": config.get('KEYWORDS', []),
         "keywords_count": len(config.get('KEYWORDS', [])),
         "filters": config.get('FILTERS', {}),
+        "detect_links": config.get('DETECT_LINKS', True),
         "channel_id": os.environ.get('CHANNEL_ID'),
         "main_admin_id": MAIN_ADMIN_ID,
         "additional_admins": config.get('ADMINS', []),
@@ -161,6 +162,39 @@ def contains_mention(text):
     """كشف وجود معرفات (@username)"""
     mention_pattern = r'@[a-zA-Z0-9_]+'
     return bool(re.search(mention_pattern, text))
+
+def detect_special_links(text):
+    """كشف روابط الواتساب وروابط قروبات التلجرام
+    يعيد قائمة بأنواع الروابط المكتشفة (مثلاً: ['واتساب', 'قروب تلجرام'])
+    """
+    found = []
+    text_lower = text.lower()
+    
+    # روابط الواتساب
+    whatsapp_patterns = [
+        r'wa\.me/[^\s]+',
+        r'whatsapp\.com/[^\s]+',
+        r'chat\.whatsapp\.com/[^\s]+',
+        r'api\.whatsapp\.com/[^\s]+',
+    ]
+    for pat in whatsapp_patterns:
+        if re.search(pat, text_lower):
+            found.append('واتساب')
+            break
+    
+    # روابط قروبات التلجرام (دعوات الانضمام)
+    telegram_group_patterns = [
+        r't\.me/\+[a-zA-Z0-9_-]+',          # t.me/+abc123 (دعوة خاصة)
+        r't\.me/joinchat/[a-zA-Z0-9_-]+',   # t.me/joinchat/abc123 (دعوة خاصة)
+        r'telegram\.me/\+[a-zA-Z0-9_-]+',
+        r'telegram\.me/joinchat/[a-zA-Z0-9_-]+',
+    ]
+    for pat in telegram_group_patterns:
+        if re.search(pat, text_lower):
+            found.append('قروب تلجرام')
+            break
+    
+    return found
 
 def is_too_long(text, max_length=50):
     """الرسالة طويلة جداً (أكثر من max_length)"""
@@ -340,12 +374,26 @@ async def process_message(event, client, phone):
     
     # التحقق من الكلمات المفتاحية
     matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
-    if not matched_keywords:
-        return  # ما فيها كلمة مفتاحية
+    
+    # كشف الروابط الخاصة (واتساب + قروبات تلجرام) — تُحوّل حتى لو ما طابقت كلمة مفتاحية
+    detected_links = []
+    if config.get('DETECT_LINKS', True):
+        detected_links = detect_special_links(message_text)
+    
+    # لازم تطابق كلمة مفتاحية OR تحتوي على رابط خاص
+    if not matched_keywords and not detected_links:
+        return  # ما فيها كلمة مفتاحية ولا رابط خاص
     
     stats['messages_matched'] += 1
     stats['last_matched_at'] = time.time()
-    logger.info(f"🎯 مطابقة! من {phone} | كلمات: {matched_keywords} | نص: {message_text[:60]}")
+    
+    # تجهيز وصف المطابقة للـ logs
+    match_desc_parts = []
+    if matched_keywords:
+        match_desc_parts.append(f"كلمات: {matched_keywords}")
+    if detected_links:
+        match_desc_parts.append(f"روابط: {detected_links}")
+    logger.info(f"🎯 مطابقة! من {phone} | {' | '.join(match_desc_parts)} | نص: {message_text[:60]}")
     
     try:
         chat = await event.get_chat()
@@ -365,15 +413,25 @@ async def process_message(event, client, phone):
         except:
             pass
         
-        link = ""
+        # بناء رابط الرسالة المباشر للقروب
+        msg_url = ""
         if event.chat:
             if getattr(event.chat, 'username', None):
-                link = f"https://t.me/{event.chat.username}/{event.id}"
+                # قروب عام — رابط مباشر يفتح للجميع
+                msg_url = f"https://t.me/{event.chat.username}/{event.id}"
             else:
+                # قروب خاص — رابط مباشر يفتح للأعضاء فقط
                 c_id = str(event.chat_id).replace('-100', '')
-                link = f"https://t.me/c/{c_id}/{event.id}"
+                msg_url = f"https://t.me/c/{c_id}/{event.id}"
         
-        matched_keyword = matched_keywords[0]
+        # تجهيز وصف سبب المطابقة
+        match_reason_parts = []
+        if matched_keywords:
+            match_reason_parts.append(f"🔑 الكلمة: `{matched_keywords[0]}`" + (f" (+{len(matched_keywords)-1} أخرى)" if len(matched_keywords) > 1 else ""))
+        if detected_links:
+            link_types = '، '.join(detected_links)
+            match_reason_parts.append(f"🔗 رابط: {link_types}")
+        match_reason = '\n'.join(match_reason_parts)
         
         # ===== عرض الحساب المراقب الذي جاءت منه الرسالة =====
         forward_text = (
@@ -381,7 +439,7 @@ async def process_message(event, client, phone):
             f"👥 **المجموعة:** {chat_title}\n"
             f"👤 **المرسل:** {sender_name if sender_name else 'مستخدم'} (`{sender_id}`)\n"
             f"📱 **الحساب المراقب:** `{phone}`\n"
-            f"🔑 **الكلمة المطابقة:** `{matched_keyword}`\n"
+            f"{match_reason}\n"
             f"📝 **الرسالة:**\n{message_text}\n"
         )
         
@@ -406,8 +464,11 @@ async def process_message(event, client, phone):
         ]
         all_buttons.append(add_reply_row)
         
-        # زر عرض الرسالة - يحاول يدخلك للقروب حتى لو مو مشترك
-        all_buttons.append([Button.inline("🔗 عرض الرسالة", f"go_msg_{event.chat_id}_{event.id}".encode())])
+        # زر فتح الرسالة — رابط مباشر يفتح الرسالة في تيليجرام فوراً
+        # - قروب عام: يفتح للجميع (مع أو بدون عضوية)
+        # - قروب خاص: يفتح للأعضاء فقط (تيليجرام لا يسمح بفتح رسائل القروبات الخاصة لغير الأعضاء)
+        if msg_url:
+            all_buttons.append([Button.url("🔗 فتح الرسالة", url=msg_url)])
         
         sent_msg = await bot.send_message(CHANNEL_ID, forward_text, buttons=all_buttons if all_buttons else None)
         

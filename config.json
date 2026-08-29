@@ -1,24 +1,12 @@
 {
     "TARGET_GROUPS": [],
     "KEYWORDS": [
-        "کانفیک",
-        "کانفینگ",
-        "وی پی ان",
-        "ویپی ان",
-        "vpn",
-        "پروکسی",
-        "فیلترشکن",
-        "فیلتر شکن",
-        "ویتو",
-        "ویتوری",
-        "وی تو ری",
-        "وی توری",
-        "v2ray",
-        "v2rayng",
-        "V2rayng",
-        "V2ray",
-        "V2RAYNG",
-        "V2RAY"
+        "يسوي",
+        "يحل",
+        "احد",
+        "تعرفون",
+        "ابغى",
+        "ابغي"
     ],
     "IGNORE_USERS": [],
     "ADMINS": [],
@@ -32,5 +20,6 @@
         "block_ads": false,
         "block_suspicious": false
     },
-    "DUPLICATE_DETECTION": true
+    "DUPLICATE_DETECTION": true,
+    "DETECT_LINKS": true
 }
