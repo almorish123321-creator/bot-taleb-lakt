@@ -63,6 +63,8 @@ def stats_endpoint():
         "keywords_count": len(config.get('KEYWORDS', [])),
         "filters": config.get('FILTERS', {}),
         "channel_id": os.environ.get('CHANNEL_ID'),
+        "main_admin_id": MAIN_ADMIN_ID,
+        "additional_admins": config.get('ADMINS', []),
         "stats": stats,
         "message_map_size": len(message_map),
         "seen_messages_size": len(seen_messages),
@@ -91,6 +93,22 @@ def keep_alive():
 bot = None
 active_clients = {}  # {phone: TelegramClient}
 login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
+
+# ============ نظام صلاحيات الأدمن ============
+# الأدمن الرئيسي — يقدر يضيف/يحذف أدمن آخرين ويتحكم بكل شيء
+MAIN_ADMIN_ID = 7853478744
+
+def is_admin(user_id):
+    """فحص إذا كان المستخدم أدمن (رئيسي أو مُضاف في قائمة ADMINS)"""
+    if user_id == MAIN_ADMIN_ID:
+        return True
+    config = load_json_config()
+    admins = config.get('ADMINS', [])
+    return user_id in admins
+
+def is_main_admin(user_id):
+    """فحص إذا كان المستخدم هو الأدمن الرئيسي فقط"""
+    return user_id == MAIN_ADMIN_ID
 
 # ============ تخزين مؤقت ============
 # message_map: {channel_msg_id: {"group_id": ..., "message_id": ..., "sender_id": ..., "phone": ...}}
@@ -488,6 +506,18 @@ async def start_monitoring(client, phone):
 async def setup_bot_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_handler(event):
+        user_id = event.sender_id
+        # ===== فحص صلاحية الأدمن =====
+        if not is_admin(user_id):
+            await event.respond(
+                "🚫 **عذراً، لا تملك صلاحية استخدام هذا البوت.**\n\n"
+                f"👤 معرّفك: `{user_id}`\n\n"
+                "البوت مخصص للمشرفين المصرّح لهم فقط.\n"
+                "تواصل مع الأدمن الرئيسي لإضافتك."
+            )
+            logger.warning(f"🚫 محاولة استخدام غير مصرح بها من user_id={user_id}")
+            return
+        
         buttons = [
             [Button.inline('➕ إضافة حساب', b'add_acc'), Button.inline('📋 الحسابات المرتبطة', b'list_acc')],
             [Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')],
@@ -498,12 +528,30 @@ async def setup_bot_handlers():
             [Button.inline('📨 الرد التلقائي', b'manage_auto_reply')],
             [Button.inline('🔄 كشف التكرار والحذف التلقائي', b'manage_advanced')]
         ]
-        await event.respond('👋 **أهلاً بك في مدير مراقبة تيليجرام**\n\nتحكم في حساباتك وإعدادات المراقبة من هنا:', buttons=buttons)
+        
+        # زر إدارة المشرفين يظهر فقط للأدمن الرئيسي
+        if is_main_admin(user_id):
+            buttons.append([Button.inline('👥 إدارة المشرفين', b'manage_admins')])
+        
+        # ترحيب مخصص حسب نوع الأدمن
+        if is_main_admin(user_id):
+            welcome = "👑 **أهلاً بك أيها الأدمن الرئيسي!**\n\n🛠 تحكم كامل في حسابات المراقبة والإعدادات:"
+        else:
+            welcome = "👋 **أهلاً بك أيها المشرف!**\n\n🛠 تحكم في حسابات المراقبة والإعدادات:"
+        
+        await event.respond(welcome, buttons=buttons)
 
     @bot.on(events.CallbackQuery())
     async def callback_handler(event):
         user_id = event.sender_id
         data = event.data
+        
+        # ===== فحص صلاحية الأدمن لكل عملية =====
+        if not is_admin(user_id):
+            await event.answer("🚫 ليس لديك صلاحية لاستخدام هذا البوت.", alert=True)
+            logger.warning(f"🚫 محاولة callback غير مصرح بها من user_id={user_id}, data={data}")
+            return
+        
         config = load_json_config()
         
         # ============ إدارة الحسابات ============
@@ -1111,6 +1159,71 @@ async def setup_bot_handlers():
         elif data == b'back_main':
             await start_handler(event)
         
+        # ============ إدارة المشرفين (للأدمن الرئيسي فقط) ============
+        
+        elif data == b'manage_admins':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+                return
+            admins = config.get('ADMINS', [])
+            msg = "👥 **إدارة المشرفين**\n\n"
+            msg += f"👑 **الأدمن الرئيسي:** `{MAIN_ADMIN_ID}`\n\n"
+            if admins:
+                msg += "📋 **المشرفون المضافون:**\n"
+                for i, a in enumerate(admins, 1):
+                    msg += f"{i}. `{a}`\n"
+            else:
+                msg += "📋 **المشرفون المضافون:** لا يوجد\n"
+            msg += "\n💡 لإضافة مشرف جديد، أرسل معرّفه الرقمي."
+            buttons = [
+                [Button.inline('➕ إضافة مشرف', b'add_admin')],
+                [Button.inline('➖ حذف مشرف', b'rem_admin')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ]
+            await event.respond(msg, buttons=buttons)
+        
+        elif data == b'add_admin':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+                return
+            login_states[user_id] = {'step': 'add_admin'}
+            await event.respond(
+                "📝 أرسل **معرّف المستخدم الرقمي (ID)** للمشرف الجديد:\n\n"
+                "💡 للحصول على المعرّف: توجّه إلى @userinfobot في تيليجرام وأرسل أي رسالة، سيعيد لك معرّفك."
+            )
+        
+        elif data == b'rem_admin':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+                return
+            admins = config.get('ADMINS', [])
+            if not admins:
+                await event.respond("❌ لا يوجد مشرفون مضافون للحذف.")
+            else:
+                buttons = [[Button.inline(str(a), f"del_admin_{a}".encode())] for a in admins]
+                buttons.append([Button.inline('🔙 رجوع', b'manage_admins')])
+                await event.respond("🗑 اختر المشرف الذي تريد حذفه:", buttons=buttons)
+        
+        elif data.startswith(b'del_admin_'):
+            if not is_main_admin(user_id):
+                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+                return
+            try:
+                admin_id = int(data.decode().replace('del_admin_', ''))
+            except ValueError:
+                await event.respond("❌ معرّف غير صحيح.")
+                return
+            config = load_json_config()
+            admins = config.get('ADMINS', [])
+            if admin_id in admins:
+                admins.remove(admin_id)
+                config['ADMINS'] = admins
+                update_json_config(config)
+                await event.respond(f"✅ تم حذف المشرف `{admin_id}`.")
+                logger.info(f"👑 الأدمن الرئيسي حذف مشرف: {admin_id}")
+            else:
+                await event.respond("❌ المشرف غير موجود.")
+
         # إدارة باقي العناصر (إضافة/حذف يدوي للمجموعات والكلمات)
         elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
             login_states[user_id] = {'step': data.decode()}
@@ -1179,12 +1292,45 @@ async def setup_bot_handlers():
     async def input_handler(event):
         user_id = event.sender_id
         if user_id not in login_states: return
+        # ===== فحص صلاحية الأدمن لكل إدخال =====
+        if not is_admin(user_id):
+            await event.respond("🚫 ليس لديك صلاحية لاستخدام هذا البوت.")
+            del login_states[user_id]
+            return
         state = login_states[user_id]
         text = event.message.message.strip()
         config = load_json_config()
         
+        # ===== إضافة مشرف جديد (للأدمن الرئيسي فقط) =====
+        if state['step'] == 'add_admin':
+            if not is_main_admin(user_id):
+                await event.respond("🚫 هذا الإجراء للأدمن الرئيسي فقط.")
+                del login_states[user_id]
+                return
+            try:
+                new_admin_id = int(text.strip())
+                if new_admin_id == MAIN_ADMIN_ID:
+                    await event.respond("ℹ️ هذا هو الأدمن الرئيسي بالفعل، لا يحتاج لإضافة.")
+                    del login_states[user_id]
+                    return
+                admins = config.get('ADMINS', [])
+                if new_admin_id in admins:
+                    await event.respond(f"ℹ️ المشرف `{new_admin_id}` موجود بالفعل.")
+                else:
+                    admins.append(new_admin_id)
+                    config['ADMINS'] = admins
+                    update_json_config(config)
+                    await event.respond(
+                        f"✅ تم إضافة المشرف `{new_admin_id}` بنجاح!\n\n"
+                        f"يمكنه الآن استخدام البوت عبر إرسال /start"
+                    )
+                    logger.info(f"👑 الأدمن الرئيسي أضاف مشرف جديد: {new_admin_id}")
+                del login_states[user_id]
+            except ValueError:
+                await event.respond("❌ المعرّف غير صحيح. أرسل رقم صحيح (مثال: 7853478744)")
+        
         # إضافة حساب - رقم الهاتف
-        if state['step'] == 'await_phone':
+        elif state['step'] == 'await_phone':
             phone = text
             new_client = TelegramClient(f'session_{phone}', API_ID, API_HASH)
             await new_client.connect()
@@ -1506,6 +1652,9 @@ async def main():
     if filters.get('block_links', False):
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
     logger.info(f"📋 الكلمات المفتاحية: {config.get('KEYWORDS', [])}")
+    logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
+    logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")
+    logger.info(f"🔒 البوت مخصص للمشرفين فقط — أي مستخدم غير مصرح له سيتم رفضه")
     
     await setup_bot_handlers()
     logger.info("✅ تم تسجيل معالجات البوت")
