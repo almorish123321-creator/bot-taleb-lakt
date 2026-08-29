@@ -62,6 +62,7 @@ def stats_endpoint():
         "keywords_loaded": config.get('KEYWORDS', []),
         "keywords_count": len(config.get('KEYWORDS', [])),
         "filters": config.get('FILTERS', {}),
+        "channel_id": os.environ.get('CHANNEL_ID'),
         "stats": stats,
         "message_map_size": len(message_map),
         "seen_messages_size": len(seen_messages),
@@ -252,6 +253,20 @@ async def process_message(event, client, phone):
     if event.is_private:
         return
     
+    # ===== منع حلقة التكرار اللانهائية =====
+    # 1) لا نراقب القناة المخصصة للتحويل (CHANNEL_ID) أبداً
+    #    لأن البوت يحوّل إليها، فيجب ألا يلتقط رسائله المحوّلة مجدداً
+    try:
+        current_channel_id = int(os.environ.get('CHANNEL_ID', 0))
+    except (ValueError, TypeError):
+        current_channel_id = 0
+    
+    if current_channel_id and event.chat_id == current_channel_id:
+        return  # تجاهل صامت — ما نسجل حتى إحصائية
+    
+    # 2) لا نراقب رسائل البوت نفسه (sender_id == bot id) أو أي رسالة تبدأ بصيغة تقرير البوت
+    #    (حتى لو وصلت من قناة/قروب ثاني عبر إعادة توجيه)
+    
     sender_id = event.sender_id
     if sender_id in ignore_users:
         return
@@ -266,6 +281,14 @@ async def process_message(event, client, phone):
     if not message_text:
         return  # ما فيه نص نراقبه
     
+    # ===== منع حلقة التكرار: تجاهل رسائل البوت نفسه =====
+    # نتعرف على رسائل البوت بمحتواها (تبدأ بنمط تقرير البوت)
+    bot_signature = "📢 **تم العثور على رسالة مطابقة"
+    if message_text.startswith(bot_signature) or message_text.startswith("📢 تم العثور على رسالة مطابقة"):
+        # رسالة محوّلة من البوت نفسه — تجاهل لمنع التكرار اللانهائي
+        logger.info(f"🚫 تم تجاهل رسالة محوّلة من البوت (منع حلقة التكرار) - phone={phone}")
+        return
+    
     # ===== عداد: رسالة واردة =====
     stats['messages_received'] += 1
     stats['last_received_at'] = time.time()
@@ -279,13 +302,23 @@ async def process_message(event, client, phone):
         logger.warning(f"⛔ تم تجاهل رسالة من {phone} في القروب {event.chat_id}: {', '.join(ignore_reasons)} | نص الرسالة: {message_text[:80]}")
         return
     
-    # ===== كشف التكرار =====
+    # ===== كشف التكرار المحسّن =====
+    # 1) مفتاح أساسي: chat_id + message_id + sender_id (للرسائل الواحدة)
+    # 2) مفتاح ثانوي: hash نص الرسالة (للرسائل المتطابقة من مصادر مختلفة)
     if config.get('DUPLICATE_DETECTION', True):
         msg_key = f"{event.chat_id}_{event.id}_{sender_id}"
         if msg_key in seen_messages:
-            logger.info(f"تم تجاهل رسالة مكررة من {phone}")
+            logger.info(f"تم تجاهل رسالة مكررة (نفس msg_id) من {phone}")
             return
         seen_messages.add(msg_key)
+        
+        # كشف التكرار بالنص: لو نفس النص وصل خلال آخر 60 ثانية، تجاهل
+        text_hash = hash(message_text.strip().lower())
+        text_key = f"text_{text_hash}"
+        if text_key in seen_messages:
+            logger.info(f"تم تجاهل رسالة مكررة (نفس النص) من {phone}: {message_text[:50]}")
+            return
+        seen_messages.add(text_key)
     
     # التحقق من الكلمات المفتاحية
     matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
